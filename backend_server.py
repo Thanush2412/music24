@@ -68,93 +68,120 @@ class YouTubeMusicBackend:
             return {"error": str(e), "video_id": video_id}
     
     def get_audio_url(self, video_id: str) -> Dict[str, Any]:
-        """Get playable audio URL using ytmusicapi streaming URLs (no yt-dlp needed)."""
+        """Extract playable audio URL using yt-dlp (old method - play video as audio)."""
+        import time
+        
+        # Get song details first using ytmusicapi
         try:
-            # Get song details first
             song = self.ytmusic.get_song(video_id)
             video_details = song.get("videoDetails", {})
-            
             title = video_details.get("title", "Unknown")
             artist = video_details.get("author", "Unknown")
             thumbnail = video_details.get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url", "")
             duration_seconds = int(video_details.get("lengthSeconds", 0))
-            
-            # Get watch playlist which contains streaming URLs
-            watch_playlist = self.ytmusic.get_watch_playlist(video_id)
-            
-            # Extract streaming URLs from watch playlist
-            audio_url = None
-            audio_formats = []
-            
-            # Check for streaming URLs in the playlist
-            if watch_playlist:
-                # Try to get streaming URL from adaptive formats
-                streaming_data = watch_playlist.get("streamingData", {})
-                if streaming_data:
-                    # Get adaptive formats (audio only)
-                    adaptive_formats = streaming_data.get("adaptiveFormats", [])
-                    for fmt in adaptive_formats:
-                        if fmt.get("mimeType", "").startswith("audio/"):
-                            url = fmt.get("url") or fmt.get("signatureCipher", "")
-                            if url:
+        except:
+            title = "Unknown"
+            artist = "Unknown"
+            thumbnail = ""
+            duration_seconds = 0
+        
+        # Use yt-dlp to extract audio stream URLs
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        # Try different yt-dlp configurations
+        configs = [
+            {
+                "format": "bestaudio/best",
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": False,
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "referer": "https://www.youtube.com/",
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["android"],
+                        "player_skip": ["webpage"],
+                    }
+                },
+            },
+            {
+                "format": "bestaudio/best",
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": False,
+                "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+                "referer": "https://www.youtube.com/",
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["ios"],
+                        "player_skip": ["webpage"],
+                    }
+                },
+            },
+        ]
+        
+        for attempt, ydl_opts in enumerate(configs):
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    
+                    # Get best audio format
+                    audio_url = None
+                    audio_formats = []
+                    
+                    for f in info.get("formats", []):
+                        if f.get("acodec") != "none" and f.get("vcodec") == "none":
+                            stream_url = f.get("url")
+                            if stream_url and stream_url.startswith("http"):
                                 audio_formats.append({
-                                    "url": url,
-                                    "ext": fmt.get("mimeType", "").split("/")[1].split(";")[0],
-                                    "bitrate": fmt.get("bitrate", 0),
-                                    "format": fmt.get("itag", ""),
+                                    "url": stream_url,
+                                    "ext": f.get("ext", "m4a"),
+                                    "bitrate": f.get("abr", 0),
+                                    "format": str(f.get("format_id", "")),
                                 })
                     
-                    # Sort by bitrate
+                    # Sort by bitrate and get best
                     audio_formats.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
+                    
                     if audio_formats:
                         audio_url = audio_formats[0]["url"]
-            
-            # Fallback: Return YouTube Music watch URL that can be played directly
-            if not audio_url:
-                # Return a direct YouTube Music URL - React Native can play this
-                audio_url = f"https://music.youtube.com/watch?v={video_id}"
-                audio_formats = [{
-                    "url": audio_url,
-                    "ext": "web",
-                    "bitrate": 0,
-                    "format": "youtube_music",
-                }]
-            
-            return {
-                "video_id": video_id,
-                "title": title,
-                "artist": artist,
-                "album": "",
-                "duration_seconds": duration_seconds,
-                "thumbnail": thumbnail,
-                "audio_url": audio_url,
-                "audio_formats": audio_formats[:3],
-                "genre": "",
-                "upload_date": "",
-                "view_count": video_details.get("viewCount", "0"),
-                "like_count": 0,
-            }
-        except Exception as e:
-            # If ytmusicapi fails, return YouTube Music URL as fallback
-            return {
-                "video_id": video_id,
-                "title": "Unknown",
-                "artist": "Unknown",
-                "album": "",
-                "duration_seconds": 0,
-                "thumbnail": "",
-                "audio_url": f"https://music.youtube.com/watch?v={video_id}",
-                "audio_formats": [{
-                    "url": f"https://music.youtube.com/watch?v={video_id}",
-                    "ext": "web",
-                    "bitrate": 0,
-                    "format": "youtube_music",
-                }],
-                "genre": "",
-                "upload_date": "",
-                "view_count": 0,
-                "like_count": 0,
-            }
+                    else:
+                        # Fallback to best available format
+                        audio_url = info.get("url")
+                    
+                    if audio_url and audio_url.startswith("http"):
+                        return {
+                            "video_id": video_id,
+                            "title": info.get("title", title),
+                            "artist": info.get("artist") or info.get("uploader", artist),
+                            "album": info.get("album", ""),
+                            "duration_seconds": int(info.get("duration", duration_seconds)),
+                            "thumbnail": info.get("thumbnail", thumbnail),
+                            "audio_url": audio_url,
+                            "audio_formats": audio_formats[:3],
+                            "genre": info.get("genre", ""),
+                            "upload_date": info.get("upload_date", ""),
+                            "view_count": info.get("view_count", 0),
+                            "like_count": info.get("like_count", 0),
+                        }
+            except Exception as e:
+                error_msg = str(e)
+                # Check if it's a bot detection error
+                if "Sign in to confirm" in error_msg or "bot" in error_msg.lower():
+                    if attempt < len(configs) - 1:
+                        # Wait before retry with different config
+                        time.sleep(2)
+                        continue
+                    else:
+                        # Last attempt failed - raise error so React Native can use Piped
+                        raise Exception("YouTube bot detection. React Native will use Piped API fallback.")
+                else:
+                    # Other error - try next config
+                    if attempt < len(configs) - 1:
+                        continue
+                    raise
+        
+        raise Exception("Failed to extract audio after all attempts")
     
     def get_playlist(self, playlist_id: str) -> Dict[str, Any]:
         """Get playlist with all tracks."""
