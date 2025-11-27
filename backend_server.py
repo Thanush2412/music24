@@ -68,7 +68,20 @@ class YouTubeMusicBackend:
             return {"error": str(e), "video_id": video_id}
     
     def get_audio_url(self, video_id: str) -> Dict[str, Any]:
-        """Extract playable audio URL using yt-dlp."""
+        """Extract playable audio URL using yt-dlp with ytmusicapi fallback."""
+        import time
+        
+        # Try ytmusicapi first (more reliable, less bot detection)
+        try:
+            watch_playlist = self.ytmusic.get_watch_playlist(video_id)
+            if watch_playlist and watch_playlist.get("tracks"):
+                track = watch_playlist["tracks"][0]
+                # ytmusicapi doesn't provide direct stream URLs, so fall through to yt-dlp
+                pass
+        except:
+            pass  # Fall through to yt-dlp
+        
+        # Try yt-dlp with better configuration
         url = f"https://music.youtube.com/watch?v={video_id}"
         
         ydl_opts = {
@@ -76,50 +89,83 @@ class YouTubeMusicBackend:
             "quiet": True,
             "no_warnings": True,
             "extract_flat": False,
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "referer": "https://music.youtube.com/",
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android"],
+                    "player_skip": ["webpage"],
+                }
+            },
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-us,en;q=0.5",
+                "Referer": "https://music.youtube.com/",
+            },
         }
         
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                
-                # Get best audio format
-                audio_url = None
-                audio_formats = []
-                
-                for f in info.get("formats", []):
-                    if f.get("acodec") != "none" and f.get("vcodec") == "none":
-                        audio_formats.append({
-                            "url": f.get("url"),
-                            "ext": f.get("ext"),
-                            "bitrate": f.get("abr", 0),
-                            "format": f.get("format"),
-                        })
-                
-                # Sort by bitrate and get best
-                audio_formats.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
-                
-                if audio_formats:
-                    audio_url = audio_formats[0]["url"]
+        max_retries = 2
+        retry_delay = 3
+        
+        for attempt in range(max_retries):
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    
+                    # Get best audio format
+                    audio_url = None
+                    audio_formats = []
+                    
+                    for f in info.get("formats", []):
+                        if f.get("acodec") != "none" and f.get("vcodec") == "none":
+                            audio_formats.append({
+                                "url": f.get("url"),
+                                "ext": f.get("ext"),
+                                "bitrate": f.get("abr", 0),
+                                "format": f.get("format"),
+                            })
+                    
+                    # Sort by bitrate and get best
+                    audio_formats.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
+                    
+                    if audio_formats:
+                        audio_url = audio_formats[0]["url"]
+                    else:
+                        # Fallback to best available
+                        audio_url = info.get("url")
+                    
+                    if audio_url:
+                        return {
+                            "video_id": video_id,
+                            "title": info.get("title", "Unknown"),
+                            "artist": info.get("artist") or info.get("uploader", "Unknown"),
+                            "album": info.get("album", ""),
+                            "duration_seconds": info.get("duration", 0),
+                            "thumbnail": info.get("thumbnail", ""),
+                            "audio_url": audio_url,
+                            "audio_formats": audio_formats[:3],
+                            "genre": info.get("genre", ""),
+                            "upload_date": info.get("upload_date", ""),
+                            "view_count": info.get("view_count", 0),
+                            "like_count": info.get("like_count", 0),
+                        }
+            except Exception as e:
+                error_msg = str(e)
+                # Check if it's a bot detection error
+                if "Sign in to confirm" in error_msg or "bot" in error_msg.lower():
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        # Try iOS client on retry
+                        ydl_opts["extractor_args"]["youtube"]["player_client"] = ["ios"]
+                        continue
+                    else:
+                        # Return error - let frontend handle it
+                        raise Exception("YouTube bot detection. Video may be restricted. Try a different song.")
                 else:
-                    # Fallback to best available
-                    audio_url = info.get("url")
-                
-                return {
-                    "video_id": video_id,
-                    "title": info.get("title", "Unknown"),
-                    "artist": info.get("artist") or info.get("uploader", "Unknown"),
-                    "album": info.get("album", ""),
-                    "duration_seconds": info.get("duration", 0),
-                    "thumbnail": info.get("thumbnail", ""),
-                    "audio_url": audio_url,
-                    "audio_formats": audio_formats[:3],  # Top 3 quality options
-                    "genre": info.get("genre", ""),
-                    "upload_date": info.get("upload_date", ""),
-                    "view_count": info.get("view_count", 0),
-                    "like_count": info.get("like_count", 0),
-                }
-        except Exception as e:
-            return {"error": str(e), "video_id": video_id}
+                    raise
+        
+        raise Exception("Failed to extract audio after multiple attempts")
     
     def get_playlist(self, playlist_id: str) -> Dict[str, Any]:
         """Get playlist with all tracks."""
@@ -238,7 +284,14 @@ async def get_audio(video_id: str) -> Dict[str, Any]:
     if not video_id:
         raise HTTPException(status_code=400, detail="video_id required")
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, backend.get_audio_url, video_id)
+    try:
+        result = await loop.run_in_executor(None, backend.get_audio_url, video_id)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=str(e)
+        )
 
 
 @app.get("/playlist/{playlist_id}", tags=["music"])
