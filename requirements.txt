@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+ytmusicapi
+yt-dlp
+python-dotenv
+requests
+pydantic
+asyncio
+gunicorn
