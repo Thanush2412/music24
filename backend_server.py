@@ -75,41 +75,75 @@ class YouTubeMusicBackend:
             return {"error": str(e), "video_id": video_id}
     
     def get_audio_url(self, video_id: str) -> Dict[str, Any]:
-        """Return audio URL (m4a) using yt-dlp with cookies."""
-        try:
-            # Build yt-dlp options
-            ydl_opts = {
-                "format": "bestaudio[ext=m4a]/bestaudio/best",
-                "quiet": True,
-                "no_warnings": True,
-            }
-            
-            # Add cookies if file exists (helps avoid bot detection)
-            cookies_path = "cookies.txt"
-            if os.path.exists(cookies_path):
-                ydl_opts["cookies"] = cookies_path
-            
-            # Use full YouTube URL
-            url = f"https://www.youtube.com/watch?v={video_id}"
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                
-                # Get the direct stream URL
-                audio_url = info.get("url")
-                if not audio_url:
-                    raise Exception("No audio URL found in response")
-                
-                return {
-                    "video_id": video_id,
-                    "url": audio_url,
-                    "title": info.get("title", "Unknown"),
-                    "artist": info.get("artist") or info.get("uploader", "Unknown"),
-                    "thumbnail": info.get("thumbnail", ""),
-                    "duration_seconds": int(info.get("duration", 0)),
+        """Return audio URL (m4a) using yt-dlp with cookies and retry logic."""
+        # Find cookies file (check multiple locations for production)
+        cookies_path = None
+        possible_paths = [
+            "cookies.txt",  # Current directory
+            os.path.join(os.path.dirname(__file__), "cookies.txt"),  # Same dir as script
+            os.path.expanduser("~/cookies.txt"),  # Home directory
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                cookies_path = path
+                break
+        
+        # Use full YouTube URL
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        # Retry with different player_client configurations to bypass bot detection
+        player_clients = ["android", "ios", "web"]
+        
+        last_error = None
+        
+        for client_name in player_clients:
+            try:
+                # Build yt-dlp options
+                ydl_opts = {
+                    "format": "bestaudio[ext=m4a]/bestaudio/best",
+                    "quiet": True,
+                    "no_warnings": True,
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": [client_name],
+                        }
+                    },
                 }
-        except Exception as e:
-            raise Exception(f"Stream not available: {str(e)}")
+                
+                # Add cookies if available (critical for avoiding bot detection)
+                if cookies_path:
+                    ydl_opts["cookies"] = cookies_path
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    
+                    # Get the direct stream URL
+                    audio_url = info.get("url")
+                    if not audio_url:
+                        raise Exception("No audio URL found in response")
+                    
+                    return {
+                        "video_id": video_id,
+                        "url": audio_url,
+                        "title": info.get("title", "Unknown"),
+                        "artist": info.get("artist") or info.get("uploader", "Unknown"),
+                        "thumbnail": info.get("thumbnail", ""),
+                        "duration_seconds": int(info.get("duration", 0)),
+                    }
+            except Exception as e:
+                last_error = e
+                # Continue to next client if this one fails
+                continue
+        
+        # If all retries failed, raise the last error
+        error_msg = str(last_error) if last_error else "Unknown error"
+        if "bot" in error_msg.lower() or "sign in" in error_msg.lower():
+            raise Exception(
+                f"Bot detection triggered. {'Cookies file found but may be expired.' if cookies_path else 'No cookies.txt found. Please add cookies.txt to your project root.'} "
+                f"Error: {error_msg}"
+            )
+        raise Exception(f"Stream not available: {error_msg}")
     
     def get_playlist(self, playlist_id: str) -> Dict[str, Any]:
         """Get playlist with all tracks."""
