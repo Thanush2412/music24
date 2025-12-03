@@ -1,299 +1,641 @@
-"""
-Unofficial YouTube Music Backend Server
-Returns real song data with playable audio links.
-
-Install:
-    pip install fastapi uvicorn ytmusicapi yt-dlp
-
-Run:
-    python backend_server.py
-    
-Note: For best results, export cookies from your browser to cookies.txt
-See: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp
-"""
-
-from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from ytmusicapi import YTMusic
-import yt_dlp
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import StreamingResponse
+import uvicorn
+from innertube import InnerTube
+import json
 import asyncio
+import requests
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
-import os
+import time
 
-# ============== YouTube Music Backend ==============
+app = FastAPI()
 
-class YouTubeMusicBackend:
-    """Backend that fetches real data from YouTube Music."""
+yt_web = InnerTube("WEB")
+yt_android = InnerTube("ANDROID")
+yt_music = InnerTube("WEB_MUSIC")
+
+# Thread pool for parallel audio URL fetching
+executor = ThreadPoolExecutor(max_workers=10)
+
+# Global queue and cache management
+play_queue = {}
+search_cache = {}
+trending_cache = {"data": None, "timestamp": 0}
+
+
+def get_audio_url_fast(video_id):
+    """Fast audio URL fetch - returns immediately if fails"""
+    try:
+        player = yt_android.player(video_id)
+        data = player.get("streamingData", {})
+        adaptive = data.get("adaptiveFormats", [])
+        audio = [a for a in adaptive if "audio" in a.get("mimeType", "")]
+        if not audio:
+            return None
+        best = max(audio, key=lambda x: x.get("bitrate", 0))
+        return best.get("url")
+    except:
+        return None
+
+
+def extract_video_data(video_renderer, fetch_audio=True):
+    """Extract video data - optionally skip audio for speed"""
+    try:
+        vid = video_renderer.get("videoId")
+        title = video_renderer.get("title", {}).get("runs", [{}])[0].get("text", "")
+        
+        # Author/artist
+        author = ""
+        if "longBylineText" in video_renderer:
+            author = video_renderer["longBylineText"].get("runs", [{}])[0].get("text", "")
+        elif "ownerText" in video_renderer:
+            author = video_renderer["ownerText"].get("runs", [{}])[0].get("text", "")
+        
+        # Thumbnail
+        thumb = video_renderer.get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url", "")
+        
+        # Duration
+        duration = video_renderer.get("lengthText", {}).get("simpleText", "")
+        
+        # Views
+        views = ""
+        if "viewCountText" in video_renderer:
+            views = video_renderer["viewCountText"].get("simpleText", "")
+        
+        # Published time
+        published = ""
+        if "publishedTimeText" in video_renderer:
+            published = video_renderer["publishedTimeText"].get("simpleText", "")
+        
+        # Audio URL - fetch only if requested
+        audio = None
+        if fetch_audio:
+            audio = get_audio_url_fast(vid)
+        
+        return {
+            "type": "video",
+            "title": title,
+            "videoId": vid,
+            "artist": author,
+            "thumbnail": thumb,
+            "duration": duration,
+            "views": views,
+            "published": published,
+            "audioUrl": audio
+        }
+    except:
+        return None
+
+
+def extract_playlist_data(playlist_renderer):
+    """Extract playlist data"""
+    try:
+        playlist_id = playlist_renderer.get("playlistId")
+        title = playlist_renderer.get("title", {}).get("simpleText", "")
+        
+        thumb = playlist_renderer.get("thumbnails", [{}])[0].get("thumbnails", [{}])[-1].get("url", "")
+        video_count = playlist_renderer.get("videoCount", "")
+        
+        # Channel info
+        channel = ""
+        if "longBylineText" in playlist_renderer:
+            channel = playlist_renderer["longBylineText"].get("runs", [{}])[0].get("text", "")
+        
+        first_video = None
+        videos = playlist_renderer.get("videos", [])
+        if videos and "childVideoRenderer" in videos[0]:
+            first_video = videos[0]["childVideoRenderer"].get("videoId")
+        
+        return {
+            "type": "playlist",
+            "title": title,
+            "playlistId": playlist_id,
+            "thumbnail": thumb,
+            "videoCount": video_count,
+            "channel": channel,
+            "firstVideoId": first_video
+        }
+    except:
+        return None
+
+
+def extract_channel_data(channel_renderer):
+    """Extract channel/artist data"""
+    try:
+        channel_id = channel_renderer.get("channelId")
+        title = channel_renderer.get("title", {}).get("simpleText", "")
+        
+        thumb = channel_renderer.get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url", "")
+        
+        subscribers = ""
+        if "subscriberCountText" in channel_renderer:
+            subscribers = channel_renderer["subscriberCountText"].get("simpleText", "")
+        
+        video_count = ""
+        if "videoCountText" in channel_renderer:
+            video_count = channel_renderer["videoCountText"].get("runs", [{}])[0].get("text", "")
+        
+        return {
+            "type": "channel",
+            "title": title,
+            "channelId": channel_id,
+            "thumbnail": thumb,
+            "subscribers": subscribers,
+            "videoCount": video_count
+        }
+    except:
+        return None
+
+
+def extract_all_content(response, fetch_audio=True):
+    """Extract all content types"""
+    content = []
+    continuation = None
     
-    def __init__(self):
-        self.ytmusic = YTMusic()  # No auth needed for search
-        self.executor = ThreadPoolExecutor(max_workers=4)
-    
-    def search(self, query: str, filter_type: str = "songs", limit: int = 20) -> List[Dict[str, Any]]:
-        """Search YouTube Music and return real results."""
-        try:
-            results = self.ytmusic.search(query, filter=filter_type, limit=limit)
+    def search_data(data):
+        nonlocal continuation
+        
+        if isinstance(data, dict):
+            if "videoRenderer" in data:
+                item = extract_video_data(data["videoRenderer"], fetch_audio)
+                if item:
+                    content.append(item)
             
-            songs = []
-            for item in results:
-                song = {
-                    "title": item.get("title", "Unknown"),
-                    "video_id": item.get("videoId", ""),
-                    "artist": ", ".join([a.get("name", "") for a in item.get("artists", [])]) if item.get("artists") else "Unknown",
-                    "album": item.get("album", {}).get("name", "") if item.get("album") else "",
-                    "duration": item.get("duration", ""),
-                    "duration_seconds": item.get("duration_seconds", 0),
-                    "thumbnail": item.get("thumbnails", [{}])[-1].get("url", "") if item.get("thumbnails") else "",
-                    "is_explicit": item.get("isExplicit", False),
-                    "year": item.get("year", ""),
+            elif "playlistRenderer" in data:
+                item = extract_playlist_data(data["playlistRenderer"])
+                if item:
+                    content.append(item)
+            
+            elif "channelRenderer" in data:
+                item = extract_channel_data(data["channelRenderer"])
+                if item:
+                    content.append(item)
+            
+            if "continuationCommand" in data and not continuation:
+                token = data.get("continuationCommand", {}).get("token")
+                if token:
+                    continuation = token
+            
+            if "continuation" in data and not continuation and isinstance(data["continuation"], str):
+                continuation = data["continuation"]
+            
+            for value in data.values():
+                search_data(value)
+        
+        elif isinstance(data, list):
+            for item in data:
+                search_data(item)
+    
+    search_data(response)
+    return content, continuation
+
+
+async def ultra_fast_search_stream(query: str):
+    """
+    ULTRA FAST - First result in <100ms, rest stream instantly
+    """
+    
+    print(f"\n⚡ FAST SEARCH: {query}")
+    
+    total_count = 0
+    page = 1
+    
+    # Initial search - NO audio URLs for speed
+    start = time.time()
+    response = yt_web.search(query)
+    
+    all_content, continuation = extract_all_content(response, fetch_audio=False)
+    
+    print(f"✓ Found {len(all_content)} items in {(time.time()-start)*1000:.0f}ms")
+    
+    # Stream ALL results from page 1 INSTANTLY (no audio URLs yet)
+    for item in all_content:
+        total_count += 1
+        yield f"data: {json.dumps(item)}\n\n"
+        await asyncio.sleep(0)  # Yield control but don't wait
+    
+    # Now fetch audio URLs in background and send updates
+    for item in all_content:
+        if item["type"] == "video" and not item["audioUrl"]:
+            audio = await asyncio.get_event_loop().run_in_executor(
+                executor, get_audio_url_fast, item["videoId"]
+            )
+            if audio:
+                update = {
+                    "type": "audio_update",
+                    "videoId": item["videoId"],
+                    "audioUrl": audio
                 }
-                songs.append(song)
-            
-            return songs
-        except Exception as e:
-            raise Exception(f"Search failed: {str(e)}")
+                yield f"data: {json.dumps(update)}\n\n"
     
-    def get_song_details(self, video_id: str) -> Dict[str, Any]:
-        """Get detailed song information."""
+    # Load more pages
+    seen_tokens = set()
+    
+    while continuation and page < 10:
+        if continuation in seen_tokens:
+            break
+        seen_tokens.add(continuation)
+        
+        page += 1
+        await asyncio.sleep(0.2)
+        
         try:
-            song = self.ytmusic.get_song(video_id)
-            video_details = song.get("videoDetails", {})
-            
-            return {
-                "video_id": video_id,
-                "title": video_details.get("title", "Unknown"),
-                "artist": video_details.get("author", "Unknown"),
-                "duration_seconds": int(video_details.get("lengthSeconds", 0)),
-                "thumbnail": video_details.get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url", ""),
-                "view_count": video_details.get("viewCount", "0"),
-                "description": video_details.get("shortDescription", ""),
-                "is_live": video_details.get("isLiveContent", False),
-                "channel_id": video_details.get("channelId", ""),
-            }
-        except Exception as e:
-            return {"error": str(e), "video_id": video_id}
-    
-    def get_audio_url(self, video_id: str) -> Dict[str, Any]:
-        """Return audio URL (m4a) using yt-dlp with cookies and retry logic."""
-        # Find cookies file (check multiple locations for production)
-        cookies_path = None
-        possible_paths = [
-            "cookies.txt",  # Current directory
-            os.path.join(os.path.dirname(__file__), "cookies.txt"),  # Same dir as script
-            os.path.expanduser("~/cookies.txt"),  # Home directory
-        ]
-        
-        for path in possible_paths:
-            if os.path.exists(path) and os.path.getsize(path) > 0:
-                cookies_path = path
-                break
-        
-        # Use full YouTube URL
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        
-        # Retry with different player_client configurations to bypass bot detection
-        player_clients = ["android", "ios", "web"]
-        
-        last_error = None
-        
-        for client_name in player_clients:
-            try:
-                # Build yt-dlp options
-                ydl_opts = {
-                    "format": "bestaudio[ext=m4a]/bestaudio/best",
-                    "quiet": True,
-                    "no_warnings": True,
-                    "extractor_args": {
-                        "youtube": {
-                            "player_client": [client_name],
+            response = requests.post(
+                url="https://www.youtube.com/youtubei/v1/search",
+                params={"key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"},
+                json={
+                    "context": {
+                        "client": {
+                            "clientName": "WEB",
+                            "clientVersion": "2.20231219.01.00"
                         }
                     },
-                }
-                
-                # Add cookies if available (critical for avoiding bot detection)
-                if cookies_path:
-                    ydl_opts["cookies"] = cookies_path
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    
-                    # Get the direct stream URL
-                    audio_url = info.get("url")
-                    if not audio_url:
-                        raise Exception("No audio URL found in response")
-                    
-                    return {
-                        "video_id": video_id,
-                        "url": audio_url,
-                        "title": info.get("title", "Unknown"),
-                        "artist": info.get("artist") or info.get("uploader", "Unknown"),
-                        "thumbnail": info.get("thumbnail", ""),
-                        "duration_seconds": int(info.get("duration", 0)),
-                    }
-            except Exception as e:
-                last_error = e
-                # Continue to next client if this one fails
-                continue
-        
-        # If all retries failed, raise the last error
-        error_msg = str(last_error) if last_error else "Unknown error"
-        if "bot" in error_msg.lower() or "sign in" in error_msg.lower():
-            raise Exception(
-                f"Bot detection triggered. {'Cookies file found but may be expired.' if cookies_path else 'No cookies.txt found. Please add cookies.txt to your project root.'} "
-                f"Error: {error_msg}"
+                    "continuation": continuation
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0"
+                },
+                timeout=30
             )
-        raise Exception(f"Stream not available: {error_msg}")
-    
-    def get_playlist(self, playlist_id: str) -> Dict[str, Any]:
-        """Get playlist with all tracks."""
-        try:
-            playlist = self.ytmusic.get_playlist(playlist_id, limit=100)
             
-            tracks = []
-            for track in playlist.get("tracks", []):
-                tracks.append({
-                    "title": track.get("title", "Unknown"),
-                    "video_id": track.get("videoId", ""),
-                    "artist": ", ".join([a.get("name", "") for a in track.get("artists", [])]) if track.get("artists") else "Unknown",
-                    "album": track.get("album", {}).get("name", "") if track.get("album") else "",
-                    "duration": track.get("duration", ""),
-                    "thumbnail": track.get("thumbnails", [{}])[-1].get("url", "") if track.get("thumbnails") else "",
-                })
+            if response.status_code != 200:
+                break
             
-            return {
-                "playlist_id": playlist_id,
-                "title": playlist.get("title", "Unknown Playlist"),
-                "description": playlist.get("description", ""),
-                "author": playlist.get("author", {}).get("name", "Unknown"),
-                "track_count": len(tracks),
-                "tracks": tracks,
-            }
+            data = response.json()
+            content, continuation = extract_all_content(data, fetch_audio=False)
+            
+            if not content:
+                break
+            
+            # Stream new items
+            for item in content:
+                total_count += 1
+                yield f"data: {json.dumps(item)}\n\n"
+                await asyncio.sleep(0)
+            
+            # Fetch audio URLs
+            for item in content:
+                if item["type"] == "video":
+                    audio = await asyncio.get_event_loop().run_in_executor(
+                        executor, get_audio_url_fast, item["videoId"]
+                    )
+                    if audio:
+                        update = {
+                            "type": "audio_update",
+                            "videoId": item["videoId"],
+                            "audioUrl": audio
+                        }
+                        yield f"data: {json.dumps(update)}\n\n"
+                
         except Exception as e:
-            return {"error": str(e), "playlist_id": playlist_id}
+            print(f"❌ {e}")
+            break
     
-    def get_artist(self, channel_id: str) -> Dict[str, Any]:
-        """Get artist information and top songs."""
-        try:
-            artist = self.ytmusic.get_artist(channel_id)
-            
-            top_songs = []
-            for song in artist.get("songs", {}).get("results", [])[:10]:
-                top_songs.append({
-                    "title": song.get("title", "Unknown"),
-                    "video_id": song.get("videoId", ""),
-                    "album": song.get("album", {}).get("name", "") if song.get("album") else "",
-                })
-            
-            return {
-                "channel_id": channel_id,
-                "name": artist.get("name", "Unknown"),
-                "description": artist.get("description", ""),
-                "subscriber_count": artist.get("subscribers", ""),
-                "thumbnail": artist.get("thumbnails", [{}])[-1].get("url", "") if artist.get("thumbnails") else "",
-                "top_songs": top_songs,
-            }
-        except Exception as e:
-            return {"error": str(e), "channel_id": channel_id}
+    print(f"✅ {total_count} items from {page} pages\n")
+    yield f"data: {json.dumps({'_done': True, 'total': total_count, 'pages': page})}\n\n"
 
 
-# ============== FastAPI App ==============
+@app.get("/search")
+async def search_ultra_fast(q: str):
+    """
+    🚀 ULTRA FAST search - first result in <100ms
+    Returns items instantly, audio URLs follow
+    """
+    return StreamingResponse(
+        ultra_fast_search_stream(q),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*"
+        }
+    )
 
-app = FastAPI(
-    title="YouTube Music Backend",
-    description="Returns real song data with playable audio links",
-    version="2.0.0",
-)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.get("/video/{video_id}")
+async def get_video_details(video_id: str):
+    """Get full video details with audio URL"""
+    try:
+        player = yt_android.player(video_id)
+        
+        # Video info
+        details = player.get("videoDetails", {})
+        
+        # Audio URL
+        audio_url = get_audio_url_fast(video_id)
+        
+        # Related videos
+        response = yt_web.next(video_id)
+        related = []
+        
+        def find_related(data):
+            if isinstance(data, dict):
+                if "compactVideoRenderer" in data:
+                    v = data["compactVideoRenderer"]
+                    related.append({
+                        "videoId": v.get("videoId"),
+                        "title": v.get("title", {}).get("simpleText", ""),
+                        "thumbnail": v.get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url", "")
+                    })
+                for value in data.values():
+                    find_related(value)
+            elif isinstance(data, list):
+                for item in data:
+                    find_related(item)
+        
+        find_related(response)
+        
+        return {
+            "videoId": video_id,
+            "title": details.get("title"),
+            "author": details.get("author"),
+            "duration": details.get("lengthSeconds"),
+            "views": details.get("viewCount"),
+            "thumbnail": details.get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url"),
+            "audioUrl": audio_url,
+            "related": related[:10]
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
-backend = YouTubeMusicBackend()
+
+@app.get("/playlist/{playlist_id}")
+async def get_playlist(playlist_id: str):
+    """Get playlist with all videos"""
+    try:
+        response = yt_web.browse(f"VL{playlist_id}")
+        
+        videos = []
+        def extract_playlist_videos(data):
+            if isinstance(data, dict):
+                if "playlistVideoRenderer" in data:
+                    renderer = data["playlistVideoRenderer"]
+                    videos.append({
+                        "videoId": renderer.get("videoId"),
+                        "title": renderer.get("title", {}).get("runs", [{}])[0].get("text", ""),
+                        "thumbnail": renderer.get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url", ""),
+                        "duration": renderer.get("lengthText", {}).get("simpleText", "")
+                    })
+                for value in data.values():
+                    extract_playlist_videos(value)
+            elif isinstance(data, list):
+                for item in data:
+                    extract_playlist_videos(item)
+        
+        extract_playlist_videos(response)
+        
+        return {"playlistId": playlist_id, "videos": videos, "count": len(videos)}
+    except Exception as e:
+        return {"error": str(e)}
 
 
-@app.get("/", tags=["info"])
-async def root() -> Dict[str, Any]:
-    """API endpoints overview."""
+@app.get("/channel/{channel_id}")
+async def get_channel(channel_id: str):
+    """Get channel/artist info and videos"""
+    try:
+        response = yt_web.browse(channel_id)
+        
+        # Extract videos
+        videos = []
+        def extract_channel_videos(data):
+            if isinstance(data, dict):
+                if "gridVideoRenderer" in data or "videoRenderer" in data:
+                    renderer = data.get("gridVideoRenderer") or data.get("videoRenderer")
+                    videos.append({
+                        "videoId": renderer.get("videoId"),
+                        "title": renderer.get("title", {}).get("runs", [{}])[0].get("text", ""),
+                        "thumbnail": renderer.get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url", "")
+                    })
+                for value in data.values():
+                    extract_channel_videos(value)
+            elif isinstance(data, list):
+                for item in data:
+                    extract_channel_videos(item)
+        
+        extract_channel_videos(response)
+        
+        return {"channelId": channel_id, "videos": videos[:30], "count": len(videos)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/trending")
+async def get_trending():
+    """Get trending music videos (cached for 1 hour)"""
+    
+    # Check cache
+    if trending_cache["data"] and (time.time() - trending_cache["timestamp"]) < 3600:
+        return trending_cache["data"]
+    
+    try:
+        response = yt_web.browse("FEmusic_trending")
+        
+        videos = []
+        def extract_trending(data):
+            if isinstance(data, dict):
+                if "videoRenderer" in data:
+                    item = extract_video_data(data["videoRenderer"], fetch_audio=False)
+                    if item:
+                        videos.append(item)
+                for value in data.values():
+                    extract_trending(value)
+            elif isinstance(data, list):
+                for item in data:
+                    extract_trending(item)
+        
+        extract_trending(response)
+        
+        result = {"trending": videos[:50], "count": len(videos)}
+        trending_cache["data"] = result
+        trending_cache["timestamp"] = time.time()
+        
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/recommendations/{video_id}")
+async def get_recommendations(video_id: str):
+    """Get recommended/related videos"""
+    try:
+        response = yt_web.next(video_id)
+        
+        related = []
+        def find_related(data):
+            if isinstance(data, dict):
+                if "compactVideoRenderer" in data:
+                    item = extract_video_data(data["compactVideoRenderer"], fetch_audio=False)
+                    if item:
+                        related.append(item)
+                for value in data.values():
+                    find_related(value)
+            elif isinstance(data, list):
+                for item in data:
+                    find_related(item)
+        
+        find_related(response)
+        
+        return {"videoId": video_id, "recommendations": related[:20]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/queue/create")
+async def create_queue(session_id: str, video_ids: list[str]):
+    """Create play queue"""
+    play_queue[session_id] = {
+        "queue": video_ids,
+        "current_index": 0,
+        "history": [],
+        "shuffle": False,
+        "repeat": "off"  # off, one, all
+    }
+    return {"status": "created", "queue_size": len(video_ids)}
+
+
+@app.post("/queue/add")
+async def add_to_queue(session_id: str, video_id: str, position: Optional[int] = None):
+    """Add to queue at specific position"""
+    if session_id not in play_queue:
+        play_queue[session_id] = {"queue": [], "current_index": 0, "history": [], "shuffle": False, "repeat": "off"}
+    
+    if position is not None:
+        play_queue[session_id]["queue"].insert(position, video_id)
+    else:
+        play_queue[session_id]["queue"].append(video_id)
+    
+    return {"status": "added", "queue_size": len(play_queue[session_id]["queue"])}
+
+
+@app.get("/queue/next/{session_id}")
+async def next_in_queue(session_id: str):
+    """Next song"""
+    if session_id not in play_queue:
+        return {"error": "Queue not found"}
+    
+    queue = play_queue[session_id]
+    
+    # Handle repeat one
+    if queue.get("repeat") == "one":
+        video_id = queue["queue"][queue["current_index"]]
+    else:
+        if queue["current_index"] < len(queue["queue"]) - 1:
+            queue["current_index"] += 1
+        elif queue.get("repeat") == "all":
+            queue["current_index"] = 0
+        else:
+            return {"status": "queue_finished"}
+        
+        video_id = queue["queue"][queue["current_index"]]
+    
+    audio_url = get_audio_url_fast(video_id)
+    
     return {
-        "name": "YouTube Music Backend",
-        "version": "2.0.0",
+        "videoId": video_id,
+        "audioUrl": audio_url,
+        "queue_position": queue["current_index"],
+        "queue_size": len(queue["queue"])
+    }
+
+
+@app.get("/queue/previous/{session_id}")
+async def previous_in_queue(session_id: str):
+    """Previous song"""
+    if session_id not in play_queue:
+        return {"error": "Queue not found"}
+    
+    queue = play_queue[session_id]
+    
+    if queue["current_index"] > 0:
+        queue["current_index"] -= 1
+        video_id = queue["queue"][queue["current_index"]]
+        audio_url = get_audio_url_fast(video_id)
+        
+        return {
+            "videoId": video_id,
+            "audioUrl": audio_url,
+            "queue_position": queue["current_index"]
+        }
+    
+    return {"error": "Already at first song"}
+
+
+@app.post("/queue/shuffle/{session_id}")
+async def toggle_shuffle(session_id: str):
+    """Toggle shuffle"""
+    if session_id not in play_queue:
+        return {"error": "Queue not found"}
+    
+    play_queue[session_id]["shuffle"] = not play_queue[session_id].get("shuffle", False)
+    
+    return {"shuffle": play_queue[session_id]["shuffle"]}
+
+
+@app.post("/queue/repeat/{session_id}")
+async def set_repeat(session_id: str, mode: str):
+    """Set repeat mode: off, one, all"""
+    if session_id not in play_queue:
+        return {"error": "Queue not found"}
+    
+    if mode not in ["off", "one", "all"]:
+        return {"error": "Invalid mode"}
+    
+    play_queue[session_id]["repeat"] = mode
+    
+    return {"repeat": mode}
+
+
+@app.get("/queue/status/{session_id}")
+async def queue_status(session_id: str):
+    """Queue status"""
+    if session_id not in play_queue:
+        return {"error": "Queue not found"}
+    
+    queue = play_queue[session_id]
+    
+    return {
+        "current_index": queue["current_index"],
+        "queue_size": len(queue["queue"]),
+        "queue": queue["queue"],
+        "shuffle": queue.get("shuffle", False),
+        "repeat": queue.get("repeat", "off"),
+        "current_video": queue["queue"][queue["current_index"]] if queue["current_index"] < len(queue["queue"]) else None
+    }
+
+
+@app.get("/audio/{video_id}")
+async def get_audio_url(video_id: str):
+    """Get just the audio URL quickly"""
+    audio = get_audio_url_fast(video_id)
+    return {"videoId": video_id, "audioUrl": audio}
+
+
+@app.get("/")
+async def root():
+    return {
+        "service": "⚡ Ultra Fast YouTube Music API",
+        "features": "Instant search, Playlists, Queue, Trending, Recommendations",
         "endpoints": {
-            "search": "/search?query=YOUR_QUERY&limit=10",
-            "song_details": "/song/{video_id}",
-            "audio_url": "/audio/{video_id}",
-            "playlist": "/playlist/{playlist_id}",
-            "artist": "/artist/{channel_id}",
+            "search": "GET /search?q=QUERY - Ultra fast streaming search",
+            "video": "GET /video/{video_id} - Full video details",
+            "playlist": "GET /playlist/{playlist_id} - Playlist videos",
+            "channel": "GET /channel/{channel_id} - Channel videos",
+            "trending": "GET /trending - Trending music",
+            "recommendations": "GET /recommendations/{video_id} - Related videos",
+            "audio": "GET /audio/{video_id} - Quick audio URL",
+            "queue_create": "POST /queue/create",
+            "queue_add": "POST /queue/add",
+            "queue_next": "GET /queue/next/{session_id}",
+            "queue_prev": "GET /queue/previous/{session_id}",
+            "queue_shuffle": "POST /queue/shuffle/{session_id}",
+            "queue_repeat": "POST /queue/repeat/{session_id}?mode=off|one|all",
+            "queue_status": "GET /queue/status/{session_id}"
         }
     }
 
 
-@app.get("/search", tags=["music"])
-async def search(
-    q: str = Query(..., min_length=1, description="Search query"),
-    limit: int = Query(20, ge=1, le=50, description="Number of results")
-) -> List[Dict[str, Any]]:
-    """Search YouTube Music and return top results."""
-    try:
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(None, backend.search, q, "songs", limit)
-        return results
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/song/{video_id}", tags=["music"])
-async def get_song(video_id: str) -> Dict[str, Any]:
-    """Get song details."""
-    if not video_id:
-        raise HTTPException(status_code=400, detail="video_id required")
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, backend.get_song_details, video_id)
-
-
-@app.get("/audio/{video_id}", tags=["music"])
-async def get_audio(video_id: str) -> Dict[str, Any]:
-    """Return audio URL (m4a) using yt-dlp."""
-    if not video_id:
-        raise HTTPException(status_code=400, detail="video_id required")
-    
-    try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, backend.get_audio_url, video_id)
-        # Return simplified format matching the working example
-        return {
-            "url": result.get("url"),
-            "title": result.get("title", "Unknown"),
-            "video_id": video_id,
-            "artist": result.get("artist", ""),
-            "thumbnail": result.get("thumbnail", ""),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Stream not available: {str(e)}")
-
-
-@app.get("/playlist/{playlist_id}", tags=["music"])
-async def get_playlist(playlist_id: str) -> Dict[str, Any]:
-    """Get playlist with tracks."""
-    if not playlist_id:
-        raise HTTPException(status_code=400, detail="playlist_id required")
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, backend.get_playlist, playlist_id)
-
-
-@app.get("/artist/{channel_id}", tags=["music"])
-async def get_artist(channel_id: str) -> Dict[str, Any]:
-    """Get artist info and top songs."""
-    if not channel_id:
-        raise HTTPException(status_code=400, detail="channel_id required")
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, backend.get_artist, channel_id)
-
-
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run("backend_server:app", host="0.0.0.0", port=8000, reload=True)
