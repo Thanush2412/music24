@@ -9,6 +9,7 @@ from typing import List, Dict, Optional, Any
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import time
+import os
 
 app = FastAPI(title="Music API")
 
@@ -26,19 +27,25 @@ executor = ThreadPoolExecutor(max_workers=50)
 # Initialize YTMusic client
 ytmusic = YTMusic()
 
-async def audio_url_from_id(video_id: str, timeout: int = 8) -> Optional[str]:
-    """Get direct audio URL with aggressive timeout"""
+async def audio_url_from_id(video_id: str, timeout: int = 20) -> Optional[str]:
+    """Get direct audio URL with robust yt-dlp configuration for Render"""
     cmd = [
         'yt-dlp',
         '--no-warnings',
         '--no-playlist',
-        '--format', 'bestaudio/best',
+        '--format', 'bestaudio[ext=webm]/bestaudio/best',
         '--get-url',
-        '--socket-timeout', '5',
+        '--socket-timeout', '15',
+        '--retries', '3',
+        '--fragment-retries', '3',
         '--no-check-certificate',
-        '--extract-audio',
-        f'https://music.youtube.com/watch?v={video_id}'
+        '--quiet',
+        '--no-simulate',
+        '--extractor-args', 'youtube:player_client=android,ios',
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        f'https://www.youtube.com/watch?v={video_id}'
     ]
+    
     try:
         loop = asyncio.get_event_loop()
         result = await asyncio.wait_for(
@@ -46,10 +53,21 @@ async def audio_url_from_id(video_id: str, timeout: int = 8) -> Optional[str]:
                 executor,
                 partial(subprocess.run, cmd, capture_output=True, text=True, timeout=timeout)
             ),
-            timeout=timeout + 1
+            timeout=timeout + 2
         )
+        
         if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
+            url = result.stdout.strip().split('\n')[0]
+            # Verify it's a direct playable URL
+            if 'googlevideo.com' in url:
+                return url
+            print(f"Non-direct URL for {video_id}: {url[:100]}")
+        else:
+            print(f"yt-dlp failed for {video_id}: {result.stderr[:200]}")
+        
+        return None
+    except asyncio.TimeoutError:
+        print(f"Timeout extracting {video_id}")
         return None
     except Exception as e:
         print(f"Audio fetch error for {video_id}: {e}")
@@ -229,7 +247,7 @@ async def stream_with_audio_updates(initial_data: Dict, items: List[Dict], max_c
                 'type': 'audio_update',
                 'index': idx,
                 'video_id': item['video_id'],
-                'audio_url': audio_url or f'https://music.youtube.com/watch?v={item["video_id"]}',
+                'audio_url': audio_url,
                 'direct': is_direct,
                 'fetch_time': f"{fetch_time:.2f}s",
                 'progress': {
@@ -448,7 +466,7 @@ async def search(
         
         # Add items to metadata
         if metadata.get('content_type') == 'artist':
-            metadata['tracks'] = items  # top_songs with audio
+            metadata['tracks'] = items
         else:
             metadata['results'] = items
         
@@ -528,7 +546,7 @@ async def get_song(video_id: str):
             "title": video_details.get('title', 'Unknown'),
             "artist": video_details.get('author', 'Unknown'),
             "thumbnail": get_thumbnail(video_details.get('thumbnail', {}).get('thumbnails', [])),
-            "audio_url": audio_url or f'https://music.youtube.com/watch?v={video_id}',
+            "audio_url": audio_url,
             "direct_audio": bool(audio_url and 'googlevideo' in audio_url),
             "time_taken": f"{time.time() - start:.2f}s"
         }
@@ -543,106 +561,76 @@ async def get_audio(video_id: str):
     
     return {
         "video_id": video_id,
-        "audio_url": audio_url or f'https://music.youtube.com/watch?v={video_id}',
+        "audio_url": audio_url,
         "direct": bool(audio_url and 'googlevideo' in audio_url),
         "time_taken": f"{time.time() - start:.2f}s"
+    }
+
+@app.get("/debug/ytdlp")
+async def debug_ytdlp():
+    """Debug yt-dlp installation and configuration"""
+    import sys
+    
+    # Check yt-dlp version
+    version_cmd = ['yt-dlp', '--version']
+    version_result = subprocess.run(version_cmd, capture_output=True, text=True)
+    
+    # Check yt-dlp path
+    which_cmd = ['which', 'yt-dlp']
+    which_result = subprocess.run(which_cmd, capture_output=True, text=True)
+    
+    # Test extraction
+    test_id = "jNQXAC9IVRw"  # "Me at the zoo" - first YouTube video
+    test_cmd = [
+        'yt-dlp',
+        '--format', 'bestaudio',
+        '--get-url',
+        '--quiet',
+        f'https://www.youtube.com/watch?v={test_id}'
+    ]
+    test_result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=15)
+    
+    return {
+        "python_version": sys.version,
+        "yt_dlp_version": version_result.stdout.strip(),
+        "yt_dlp_path": which_result.stdout.strip(),
+        "yt_dlp_installed": version_result.returncode == 0,
+        "test_extraction": {
+            "video_id": test_id,
+            "success": test_result.returncode == 0,
+            "url": test_result.stdout.strip() if test_result.returncode == 0 else None,
+            "error": test_result.stderr if test_result.returncode != 0 else None
+        }
     }
 
 @app.get("/")
 async def root():
     """API documentation"""
     return {
-        "name": "YouTube Music API - Ultra-Fast Batch Processing",
-        "version": "5.0",
-        "description": "ONE /search endpoint for everything with SSE streaming and batch audio processing",
+        "name": "YouTube Music API - Production Ready",
+        "version": "6.0",
+        "description": "Works the same on localhost and Render with direct audio URLs",
         
         "✨ Key Features": [
-            "🚀 INSTANT response (0.3-0.5s) - shows ALL data immediately",
-            "⚡ Batch audio processing - 45+ concurrent fetches",
-            "📊 Real-time progress - see completion percentage",
-            "🎵 Works for songs, albums, playlists, artists",
-            "🔄 SSE streaming - no polling, pure real-time",
-            "📦 Up to 500 tracks with progressive loading"
+            "🚀 Direct googlevideo.com URLs (not YouTube Music embeds)",
+            "⚡ 45+ concurrent audio extractions",
+            "📊 Real-time SSE progress streaming",
+            "🔧 Production-ready for Render deployment",
+            "🎵 Songs, albums, playlists, artists",
+            "🐛 Debug endpoint to test yt-dlp"
         ],
+        
+        "🔧 Debug": {
+            "url": "/debug/ytdlp",
+            "description": "Check if yt-dlp is working correctly"
+        },
         
         "📡 Usage Examples": {
-            "search_songs": {
-                "url": "/search?q=lofi&filter=songs&limit=20",
-                "description": "Search songs with streaming audio"
-            },
-            "get_album": {
-                "url": "/search?q=MPREb_xxxxx",
-                "description": "Get album with ALL tracks + audio URLs streaming"
-            },
-            "get_playlist": {
-                "url": "/search?q=PLxxxxxxx&limit=100",
-                "description": "Get playlist (up to 500 tracks) with audio streaming"
-            },
-            "get_artist": {
-                "url": "/search?q=UCxxxxxxx",
-                "description": "Get artist top songs + albums with audio"
-            },
-            "batch_audio": {
-                "url": "/audio/batch?video_ids=id1,id2,id3&max_concurrent=45",
-                "description": "Batch process audio URLs - ultra fast!"
-            },
-            "single_song": {
-                "url": "/song/abc123",
-                "description": "Get single song with audio (JSON)"
-            }
-        },
-        
-        "🎯 SSE Client Example": """
-const es = new EventSource('/search?q=MPREb_album123');
-
-es.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  
-  if (data.type === 'initial') {
-    // INSTANT: Show album info + ALL tracks
-    console.log(data.data.title); // Album title
-    console.log(data.data.results); // ALL 15 tracks with metadata
-    displayTracks(data.data.results); // Show everything NOW
-  }
-  
-  if (data.type === 'audio_update') {
-    // PROGRESSIVE: Audio URL ready for track at index
-    const track = tracks[data.index];
-    track.audio_url = data.audio_url;
-    enablePlayButton(data.index);
-    
-    // Progress info
-    console.log(`${data.progress.percent}% complete`);
-    console.log(`${data.progress.completed}/${data.progress.total}`);
-    console.log(`ETA: ${data.progress.estimated_remaining}`);
-  }
-  
-  if (data.type === 'complete') {
-    console.log(`All done! ${data.audio_ready} URLs ready`);
-    console.log(`Total time: ${data.total_time}`);
-    es.close();
-  }
-};
-        """,
-        
-        "🔥 Performance": {
-            "initial_response": "0.3-0.5s (instant display)",
-            "first_audio_url": "~1s (can start playing)",
-            "20_songs": "~2-3s (all audio URLs)",
-            "100_songs": "~5-7s (playlist)",
-            "concurrent_fetches": "45-50 parallel processes"
-        },
-        
-        "📋 Supported Filters": [
-            "songs", "videos", "albums", "artists",
-            "playlists", "community_playlists", "featured_playlists"
-        ],
-        
-        "🎨 Response Structure": {
-            "search": "Shows results by type (songs/albums/artists/playlists)",
-            "album": "Shows album info + all tracks with audio",
-            "playlist": "Shows playlist info + all tracks with audio",
-            "artist": "Shows artist info + top songs + albums + singles"
+            "search_songs": "/search?q=lofi&filter=songs",
+            "get_album": "/search?q=MPREb_xxxxx",
+            "get_playlist": "/search?q=PLxxxxxxx",
+            "single_song": "/song/abc123",
+            "debug": "/debug/ytdlp"
         }
     }
 
@@ -653,4 +641,3 @@ async def shutdown():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-    
