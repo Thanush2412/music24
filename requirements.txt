@@ -1,7 +1,5 @@
-fastapi
-uvicorn[standard]
+fastapi 
+uvicorn[standard 
+ytmusicapi 
+innertube 
 requests
-innertube
-yt-dlp
-httpx
-asyncio
