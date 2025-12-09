@@ -47,7 +47,7 @@ REQUEST_DELAY = 0.1  # seconds between requests
 # Initialize Innertube client
 innertube_client = InnerTube("WEB_MUSIC")
 
-# yt-dlp configuration - Optimized to avoid YouTube blocking
+# yt-dlp configuration - Optimized to avoid YouTube blocking and bot detection
 YDL_OPTS = {
     'format': 'bestaudio/best',
     'quiet': True,
@@ -57,24 +57,30 @@ YDL_OPTS = {
     'ignoreerrors': False,
     'logtostderr': False,
     'no_color': True,
-    # Use ANDROID client to avoid restrictions
+    # Use cookies for authentication (bypasses bot detection)
+    'cookiefile': 'cookies.txt',  # YouTube cookies from browser
+    # Use ANDROID client to avoid restrictions and bot detection
     'extractor_args': {
         'youtube': {
-            'player_client': ['android', 'web'],
+            'player_client': ['android_music', 'android', 'web'],
             'player_skip': ['webpage', 'configs'],
+            'skip': ['hls', 'dash'],  # Skip unnecessary formats
         }
     },
     # Better user agent to avoid detection
     'http_headers': {
-        'User-Agent': 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip',
+        'User-Agent': 'com.google.android.apps.youtube.music/5.16.51 (Linux; U; Android 11) gzip',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-us,en;q=0.5',
         'Sec-Fetch-Mode': 'navigate',
     },
-    # Additional options to prevent blocking
+    # Additional options to prevent blocking and bot detection
     'age_limit': None,
     'geo_bypass': True,
     'prefer_insecure': False,
+    # Use OAuth if available (bypasses bot detection)
+    'username': 'oauth2',
+    'password': '',
 }
 
 
@@ -182,65 +188,116 @@ def extract_search_results(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 async def get_audio_url_async(video_id: str) -> Dict[str, Any]:
-    """Extract audio URL using yt-dlp (async wrapper) - 403-proof"""
+    """Extract audio URL using yt-dlp (async wrapper) - 403-proof with bot detection bypass"""
     loop = asyncio.get_event_loop()
     
     def extract():
         url = f"https://www.youtube.com/watch?v={video_id}"
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            # Prefer audio-only formats (less likely to be blocked)
-            audio_format = None
-            formats = info.get('formats', [])
-            
-            # Priority 1: Best audio-only format (m4a, webm)
-            for fmt in formats:
-                if (fmt.get('acodec') != 'none' and 
-                    fmt.get('vcodec') == 'none' and
-                    fmt.get('ext') in ['m4a', 'webm']):
-                    if not audio_format or fmt.get('abr', 0) > audio_format.get('abr', 0):
-                        audio_format = fmt
-            
-            # Priority 2: Any audio-only format
-            if not audio_format:
-                for fmt in formats:
-                    if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
-                        audio_format = fmt
-                        break
-            
-            # Priority 3: Fallback to any format with audio
-            if not audio_format:
-                for fmt in formats:
-                    if fmt.get('acodec') != 'none':
-                        audio_format = fmt
-                        break
-            
-            if not audio_format:
-                raise Exception("No audio format found")
-            
-            # Extract HTTP headers needed for playback (prevents 403)
-            http_headers = audio_format.get('http_headers', {})
-            if not http_headers:
-                http_headers = info.get('http_headers', {})
-            
-            return {
-                'videoId': video_id,
-                'audioUrl': audio_format.get('url'),
-                'format': audio_format.get('ext', 'unknown'),
-                'bitrate': f"{audio_format.get('abr', 'unknown')}kbps",
-                'filesize': audio_format.get('filesize', 0),
-                'expiresIn': 21600,  # 6 hours (typical YouTube URL expiry)
-                'headers': {
-                    'User-Agent': http_headers.get('User-Agent', 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip'),
-                    'Accept': http_headers.get('Accept', '*/*'),
-                    'Accept-Language': http_headers.get('Accept-Language', 'en-US,en;q=0.9'),
-                    'Origin': 'https://www.youtube.com',
-                    'Referer': 'https://www.youtube.com/',
-                },
-                'protocol': audio_format.get('protocol', 'https'),
-                'quality': audio_format.get('format_note', 'audio'),
-            }
+        
+        # Try multiple strategies to bypass bot detection
+        strategies = [
+            # Strategy 1: ANDROID_MUSIC client (best for music)
+            {
+                **YDL_OPTS,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android_music'],
+                        'player_skip': ['webpage', 'configs'],
+                    }
+                }
+            },
+            # Strategy 2: ANDROID client
+            {
+                **YDL_OPTS,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android'],
+                        'player_skip': ['webpage', 'configs'],
+                    }
+                }
+            },
+            # Strategy 3: IOS client
+            {
+                **YDL_OPTS,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['ios'],
+                        'player_skip': ['webpage'],
+                    }
+                }
+            },
+        ]
+        
+        last_error = None
+        
+        for i, ydl_opts in enumerate(strategies):
+            try:
+                logger.info(f"Trying extraction strategy {i+1}/{len(strategies)}")
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    
+                    # Prefer audio-only formats (less likely to be blocked)
+                    audio_format = None
+                    formats = info.get('formats', [])
+                    
+                    # Priority 1: Best audio-only format (m4a, webm)
+                    for fmt in formats:
+                        if (fmt.get('acodec') != 'none' and 
+                            fmt.get('vcodec') == 'none' and
+                            fmt.get('ext') in ['m4a', 'webm']):
+                            if not audio_format or fmt.get('abr', 0) > audio_format.get('abr', 0):
+                                audio_format = fmt
+                    
+                    # Priority 2: Any audio-only format
+                    if not audio_format:
+                        for fmt in formats:
+                            if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
+                                audio_format = fmt
+                                break
+                    
+                    # Priority 3: Fallback to any format with audio
+                    if not audio_format:
+                        for fmt in formats:
+                            if fmt.get('acodec') != 'none':
+                                audio_format = fmt
+                                break
+                    
+                    if not audio_format:
+                        raise Exception("No audio format found")
+                    
+                    # Extract HTTP headers needed for playback (prevents 403)
+                    http_headers = audio_format.get('http_headers', {})
+                    if not http_headers:
+                        http_headers = info.get('http_headers', {})
+                    
+                    logger.info(f"Successfully extracted audio using strategy {i+1}")
+                    
+                    return {
+                        'videoId': video_id,
+                        'audioUrl': audio_format.get('url'),
+                        'format': audio_format.get('ext', 'unknown'),
+                        'bitrate': f"{audio_format.get('abr', 'unknown')}kbps",
+                        'filesize': audio_format.get('filesize', 0),
+                        'expiresIn': 21600,  # 6 hours (typical YouTube URL expiry)
+                        'headers': {
+                            'User-Agent': http_headers.get('User-Agent', 'com.google.android.apps.youtube.music/5.16.51 (Linux; U; Android 11) gzip'),
+                            'Accept': http_headers.get('Accept', '*/*'),
+                            'Accept-Language': http_headers.get('Accept-Language', 'en-US,en;q=0.9'),
+                            'Origin': 'https://www.youtube.com',
+                            'Referer': 'https://www.youtube.com/',
+                        },
+                        'protocol': audio_format.get('protocol', 'https'),
+                        'quality': audio_format.get('format_note', 'audio'),
+                    }
+                    
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Strategy {i+1} failed: {str(e)[:100]}")
+                continue
+        
+        # If all strategies failed, raise the last error
+        raise last_error if last_error else Exception("All extraction strategies failed")
     
     # Add small delay to prevent rate limiting
     await asyncio.sleep(REQUEST_DELAY)
@@ -284,21 +341,43 @@ async def search(
     limit: int = Query(20, ge=1, le=50, description="Maximum number of results")
 ):
     """
-    Search for music using Innertube
+    Search for music using yt-dlp
     
-    Returns metadata only (fast, no 403 errors)
+    Returns metadata only (fast, reliable)
     """
     try:
         logger.info(f"Search request: {q}")
         
-        # Perform search using Innertube
-        search_results = innertube_client.search(q)
+        # Use yt-dlp for search (more reliable than Innertube)
+        loop = asyncio.get_event_loop()
         
-        # Extract and format results
-        results = extract_search_results(search_results)
+        def search_youtube():
+            search_url = f"ytsearch{limit}:{q}"
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': True,  # Fast metadata only
+                'skip_download': True,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                search_results = ydl.extract_info(search_url, download=False)
+                entries = search_results.get('entries', [])
+                
+                results = []
+                for entry in entries:
+                    if entry:
+                        results.append({
+                            'videoId': entry.get('id', ''),
+                            'title': entry.get('title', ''),
+                            'artist': entry.get('uploader', entry.get('channel', 'Unknown')),
+                            'thumbnail': entry.get('thumbnail', ''),
+                            'duration': str(timedelta(seconds=entry.get('duration', 0))) if entry.get('duration') else ''
+                        })
+                
+                return results
         
-        # Limit results
-        results = results[:limit]
+        results = await loop.run_in_executor(executor, search_youtube)
         
         logger.info(f"Found {len(results)} results")
         
