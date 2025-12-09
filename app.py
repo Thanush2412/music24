@@ -426,14 +426,18 @@ async def get_playlist(
 
 if __name__ == "__main__":
     import uvicorn
+    import os
+    
+    # Get port from environment variable (for Render deployment) or use 8000
+    port = int(os.getenv("PORT", 8000))
     
     logger.info("🎵 Starting YouTube Music Backend...")
-    logger.info("📡 Server: http://localhost:8000")
-    logger.info("📚 Docs: http://localhost:8000/docs")
+    logger.info(f"📡 Server: http://0.0.0.0:{port}")
+    logger.info(f"📚 Docs: http://0.0.0.0:{port}/docs")
     
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000,
+        port=port,
         log_level="info"
     )
