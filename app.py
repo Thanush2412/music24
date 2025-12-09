@@ -20,7 +20,7 @@ app.add_middleware(
 )
 
 yt = YTMusic()                  # For metadata
-ytm = InnerTube("WEB_REMIX")    # For audio (403-proof)
+ytm = InnerTube("WEB")    # For audio (403-proof)
 
 # ---------------------------------------------------------
 # REAL AUDIO URL FETCHER (INNER TUBE)
