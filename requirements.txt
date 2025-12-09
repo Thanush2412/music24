@@ -1,6 +1,4 @@
 fastapi
 uvicorn
+yt-dlp
 ytmusicapi
-innertube
-pydantic
-requests
