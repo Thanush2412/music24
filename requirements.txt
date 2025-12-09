@@ -1,6 +1,4 @@
-fastapi 
-uvicorn[standard] 
-ytmusicapi 
-innertube 
-requests
-
+fastapi
+uvicorn
+yt-dlp
+ytmusicapi
