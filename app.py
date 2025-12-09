@@ -1,11 +1,9 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
 from ytmusicapi import YTMusic
-from yt_dlp import YoutubeDL
+from innertube import InnerTube
 
 # ---------------------------------------------------------
 # INITIAL SETUP
@@ -13,7 +11,6 @@ from yt_dlp import YoutubeDL
 
 app = FastAPI(title="Ultra Fast YouTube Music Backend")
 
-# CORS for Web
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,36 +19,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-yt = YTMusic()  # for metadata
-executor = ThreadPoolExecutor(max_workers=10)  # for yt-dlp threads
+yt = YTMusic()                  # For metadata
+ytm = InnerTube("WEB_REMIX")    # For audio (403-proof)
 
 # ---------------------------------------------------------
-# ASYNC YT-DLP FUNCTION
+# REAL AUDIO URL FETCHER (INNER TUBE)
 # ---------------------------------------------------------
 
-async def get_audio_url(video_id: str):
-    loop = asyncio.get_event_loop()
+def get_audio_streams(video_id: str):
+    try:
+        player = ytm.player(video_id=video_id)
+        formats = player["streamingData"]["adaptiveFormats"]
 
-    def run():
-        try:
-            with YoutubeDL({
-                "quiet": True,
-                "format": "bestaudio/best",
-                "no_warnings": True,
-            }) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-                return {
-                    "url": info.get("url"),
-                    "title": info.get("title"),
-                    "duration": info.get("duration"),
-                }
-        except Exception as e:
-            return {"error": str(e)}
+        audio_streams = []
+        for f in formats:
+            if f.get("mimeType", "").startswith("audio/"):
+                audio_streams.append({
+                    "itag": f.get("itag"),
+                    "mime": f.get("mimeType"),
+                    "bitrate": f.get("bitrate"),
+                    "url": f.get("url"),  # REAL playable audio URL
+                })
 
-    return await loop.run_in_executor(executor, run)
+        return {
+            "videoId": video_id,
+            "streams": audio_streams
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
 
 # ---------------------------------------------------------
-# SEARCH ENDPOINT (YT MUSIC)
+# SEARCH ENDPOINT
 # ---------------------------------------------------------
 
 @app.get("/search")
@@ -77,16 +76,15 @@ async def search_music(q: str = Query(...)):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # ---------------------------------------------------------
-# AUDIO URL ENDPOINT (403-PROOF)
+# AUDIO URL ENDPOINT – 403-PROOF
 # ---------------------------------------------------------
 
 @app.get("/audio")
 async def audio(videoId: str = Query(...)):
-    data = await get_audio_url(videoId)
-    return data
+    return get_audio_streams(videoId)
 
 # ---------------------------------------------------------
-# PLAYLIST ENDPOINT (OPTIONAL)
+# PLAYLIST ENDPOINT
 # ---------------------------------------------------------
 
 @app.get("/playlist")
@@ -113,6 +111,10 @@ async def playlist(listId: str = Query(...)):
 
     except Exception as e:
         return {"error": str(e)}
+
+# ---------------------------------------------------------
+# START SERVER (Render auto-detects)
+# ---------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
