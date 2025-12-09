@@ -1,16 +1,12 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-
+from yt_dlp import YoutubeDL
 from ytmusicapi import YTMusic
-from innertube import InnerTube
 
-# ---------------------------------------------------------
-# INITIAL SETUP
-# ---------------------------------------------------------
+app = FastAPI(title="Pure Music API - One File Server")
 
-app = FastAPI(title="Ultra Fast YouTube Music Backend")
-
+# CORS setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,103 +15,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-yt = YTMusic()                  # For metadata
-ytm = InnerTube("WEB")    # For audio (403-proof)
+ytmusic = YTMusic()
 
-# ---------------------------------------------------------
-# REAL AUDIO URL FETCHER (INNER TUBE)
-# ---------------------------------------------------------
-
-def get_audio_streams(video_id: str):
-    try:
-        player = ytm.player(video_id=video_id)
-        formats = player["streamingData"]["adaptiveFormats"]
-
-        audio_streams = []
-        for f in formats:
-            if f.get("mimeType", "").startswith("audio/"):
-                audio_streams.append({
-                    "itag": f.get("itag"),
-                    "mime": f.get("mimeType"),
-                    "bitrate": f.get("bitrate"),
-                    "url": f.get("url"),  # REAL playable audio URL
-                })
-
-        return {
-            "videoId": video_id,
-            "streams": audio_streams
-        }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-# ---------------------------------------------------------
-# SEARCH ENDPOINT
-# ---------------------------------------------------------
+# ============ SEARCH ============
 
 @app.get("/search")
-async def search_music(q: str = Query(...)):
+def search_music(q: str = Query(...)):
     try:
-        results = yt.search(q, filter="songs")
-
-        final = []
-        for r in results:
-            final.append({
-                "type": r.get("resultType"),
-                "title": r.get("title"),
-                "videoId": r.get("videoId"),
-                "artists": r.get("artists"),
-                "album": r.get("album"),
-                "thumbnails": r.get("thumbnails"),
-                "duration": r.get("duration"),
-            })
-
-        return {"query": q, "results": final}
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# ---------------------------------------------------------
-# AUDIO URL ENDPOINT – 403-PROOF
-# ---------------------------------------------------------
-
-@app.get("/audio")
-async def audio(videoId: str = Query(...)):
-    return get_audio_streams(videoId)
-
-# ---------------------------------------------------------
-# PLAYLIST ENDPOINT
-# ---------------------------------------------------------
-
-@app.get("/playlist")
-async def playlist(listId: str = Query(...)):
-    try:
-        details = yt.get_playlist(listId)
-
-        tracks = []
-        for t in details["tracks"]:
-            tracks.append({
-                "title": t.get("title"),
-                "videoId": t.get("videoId"),
-                "artists": t.get("artists"),
-                "thumbnails": t.get("thumbnails")
-            })
-
-        return {
-            "playlist": {
-                "title": details.get("title"),
-                "count": len(tracks),
-                "tracks": tracks
-            }
-        }
-
+        result = ytmusic.search(query=q, filter="songs")
+        return {"query": q, "results": result}
     except Exception as e:
         return {"error": str(e)}
 
-# ---------------------------------------------------------
-# START SERVER (Render auto-detects)
-# ---------------------------------------------------------
+# ============ AUDIO URL ============
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+def get_audio_url(video_id):
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "forceurl": True,
+        "format": "bestaudio/best",
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        return info.get("url")
+
+@app.get("/audio")
+def audio_endpoint(videoId: str):
+    try:
+        url = get_audio_url(videoId)
+        return {"videoId": videoId, "audioUrl": url}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ============ SAVE TXT ============
+
+@app.get("/save")
+def save_txt(data: str):
+    try:
+        with open("data.txt", "a", encoding="utf-8") as f:
+            f.write(data + "\n")
+        return {"status": "saved", "data": data}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ============ READ TXT ============
+
+@app.get("/read")
+def read_txt():
+    try:
+        with open("data.txt", "r", encoding="utf-8") as f:
+            content = f.read()
+        return {"content": content}
+    except Exception:
+        return {"error": "No data.txt file found"}
+
+# ============ ROOT ============
+
+@app.get("/")
+def home():
+    return {"status": "running", "endpoints": ["/search", "/audio", "/save", "/read"]}
