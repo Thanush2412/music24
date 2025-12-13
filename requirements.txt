@@ -6,3 +6,4 @@ innertube
 aiofiles
 redis
 hiredis
+flask
