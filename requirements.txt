@@ -1,9 +1,4 @@
-fastapi
-uvicorn
-python-multipart
-yt-dlp
-innertube
-aiofiles
-redis
-hiredis
-flask
+Flask
+flask-cors
+ytmusicapi
+gunicorn
