@@ -1512,12 +1512,26 @@ def api_home():
             logger.warning(f"Home charts failed: {e}")
         
         try:
-            # Get new releases (search-based)
-            new_releases_query = f"new music 2024 {region}"
-            new_releases = ytmusic_client.search(new_releases_query, 'songs', 10)
-            home_data['new_releases'] = [ContentProcessor.enhance_song_metadata(song) for song in new_releases]
+            # Get diverse content sections
+            content_queries = {
+                'new_releases': f"new music 2024 {region}",
+                'romantic_hits': 'romantic love songs',
+                'party_mix': 'party dance music',
+                'chill_vibes': 'chill relaxing music',
+                'workout_mix': 'workout gym music',
+                'retro_classics': 'classic hits retro'
+            }
+            
+            for section, query in content_queries.items():
+                try:
+                    results = ytmusic_client.search(query, 'songs', 10)
+                    home_data[section] = [ContentProcessor.enhance_song_metadata(song) for song in results]
+                except Exception as e:
+                    logger.warning(f"Home {section} failed: {e}")
+                    home_data[section] = []
+                    
         except Exception as e:
-            logger.warning(f"Home new releases failed: {e}")
+            logger.warning(f"Home content sections failed: {e}")
         
         # Add personalized recommendations if user_id provided
         if user_id and config.ENABLE_ML_RECOMMENDATIONS and ml_engine.is_trained:
