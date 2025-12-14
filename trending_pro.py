@@ -1472,27 +1472,34 @@ def api_home():
         if region not in RegionManager.REGIONS:
             raise APIError(f"Invalid region: {region}", 400, "INVALID_REGION")
         
-        # Parallel loading of home content - YouTube Music style structure
+        # Parallel loading of home content - PLAYLIST FOCUSED STRUCTURE
         home_data = {
-            # Core sections
+            # Core sections (minimal songs)
             'trending': [],
             'charts': [],
             'recommendations': [],
             'new_releases': [],
             
-            # Mood sections
-            'romantic_hits': [],
-            'party_mix': [],
-            'chill_vibes': [],
-            'workout_mix': [],
-            'retro_classics': [],
+            # PRIMARY PLAYLIST SECTIONS
+            'featured_playlists': [],
+            'mood_playlists': [],
+            'genre_playlists': [],
+            'top_playlists': [],
+            'discover_playlists': [],
+            'artist_playlists': [],
             
-            # Content type sections
+            # CURATED PLAYLIST CATEGORIES
+            'romantic_playlists': [],
+            'party_playlists': [],
+            'chill_playlists': [],
+            'workout_playlists': [],
+            'focus_playlists': [],
+            'sleep_playlists': [],
+            
+            # MIXED CONTENT (secondary)
             'recommended_albums': [],
-            'recommended_playlists': [],
             'trending_artists': [],
-            'energetic_music': [],
-            'focus_music': [],
+            'trending_songs': [],
             
             # Meta information
             'personalized': user_id is not None,
@@ -1529,24 +1536,31 @@ def api_home():
             logger.warning(f"Home charts failed: {e}")
         
         try:
-            # Get diverse content sections with different content types
+            # Get diverse content sections - PLAYLIST FOCUSED
             content_sections = {
-                # Songs sections
-                'new_releases': {'query': f"new music 2024 {region}", 'type': 'songs', 'limit': 15},
-                'romantic_hits': {'query': 'romantic love songs', 'type': 'songs', 'limit': 12},
-                'party_mix': {'query': 'party dance music', 'type': 'songs', 'limit': 12},
-                'chill_vibes': {'query': 'chill relaxing music', 'type': 'songs', 'limit': 12},
-                'workout_mix': {'query': 'workout gym music', 'type': 'songs', 'limit': 12},
-                'retro_classics': {'query': 'classic hits retro', 'type': 'songs', 'limit': 12},
+                # PLAYLIST SECTIONS (Primary Focus)
+                'featured_playlists': {'query': f"featured playlists {region}", 'type': 'playlists', 'limit': 15},
+                'mood_playlists': {'query': 'mood playlists chill party workout', 'type': 'playlists', 'limit': 12},
+                'genre_playlists': {'query': 'rock pop hip hop electronic playlists', 'type': 'playlists', 'limit': 12},
+                'top_playlists': {'query': f"top playlists {region}", 'type': 'playlists', 'limit': 10},
+                'discover_playlists': {'query': 'discover weekly new music playlists', 'type': 'playlists', 'limit': 10},
+                'artist_playlists': {'query': 'artist essential playlists', 'type': 'playlists', 'limit': 8},
                 
-                # Mixed content sections
-                'recommended_albums': {'query': f"new albums 2024 {region}", 'type': 'albums', 'limit': 12},
-                'recommended_playlists': {'query': f"popular playlists {region}", 'type': 'playlists', 'limit': 10},
-                'trending_artists': {'query': f"trending artists {region}", 'type': 'artists', 'limit': 15},
+                # CURATED PLAYLIST CATEGORIES
+                'romantic_playlists': {'query': 'romantic love songs playlists', 'type': 'playlists', 'limit': 8},
+                'party_playlists': {'query': 'party dance music playlists', 'type': 'playlists', 'limit': 8},
+                'chill_playlists': {'query': 'chill relaxing music playlists', 'type': 'playlists', 'limit': 8},
+                'workout_playlists': {'query': 'workout gym music playlists', 'type': 'playlists', 'limit': 8},
+                'focus_playlists': {'query': 'focus study music playlists', 'type': 'playlists', 'limit': 8},
+                'sleep_playlists': {'query': 'sleep relaxing music playlists', 'type': 'playlists', 'limit': 6},
                 
-                # Additional mood sections
-                'energetic_music': {'query': 'energetic upbeat music', 'type': 'songs', 'limit': 12},
-                'focus_music': {'query': 'focus study music', 'type': 'songs', 'limit': 10},
+                # MIXED CONTENT (Secondary)
+                'recommended_albums': {'query': f"new albums 2024 {region}", 'type': 'albums', 'limit': 10},
+                'trending_artists': {'query': f"trending artists {region}", 'type': 'artists', 'limit': 12},
+                
+                # ESSENTIAL SONGS (Minimal)
+                'trending_songs': {'query': f"trending songs {region}", 'type': 'songs', 'limit': 10},
+                'new_releases': {'query': f"new music 2024 {region}", 'type': 'songs', 'limit': 8},
             }
             
             # Fetch content for each section
@@ -1574,52 +1588,6 @@ def api_home():
                     
         except Exception as e:
             logger.warning(f"Home content sections failed: {e}")
-
-# Helper functions for enhancing different content types
-def enhance_album_metadata(album):
-    """Enhance album metadata"""
-    return {
-        'browseId': album.get('browseId', ''),
-        'albumId': album.get('browseId', ''),
-        'title': album.get('title', 'Unknown Album'),
-        'artist': album.get('artist', {}).get('name') if isinstance(album.get('artist'), dict) else album.get('artist', 'Unknown Artist'),
-        'thumbnail': ContentProcessor.get_best_thumbnail(album.get('thumbnails', [])),
-        'thumbnails': album.get('thumbnails', []),
-        'year': album.get('year'),
-        'type': album.get('type', 'Album'),
-        'resultType': 'album',
-        'trackCount': album.get('trackCount', 0),
-        'isExplicit': album.get('isExplicit', False)
-    }
-
-def enhance_playlist_metadata(playlist):
-    """Enhance playlist metadata"""
-    return {
-        'browseId': playlist.get('browseId', ''),
-        'playlistId': playlist.get('browseId', ''),
-        'title': playlist.get('title', 'Unknown Playlist'),
-        'description': playlist.get('description', ''),
-        'thumbnail': ContentProcessor.get_best_thumbnail(playlist.get('thumbnails', [])),
-        'thumbnails': playlist.get('thumbnails', []),
-        'author': playlist.get('author', {}),
-        'trackCount': playlist.get('trackCount', 0),
-        'resultType': 'playlist',
-        'isOfficial': playlist.get('isOfficial', False)
-    }
-
-def enhance_artist_metadata(artist):
-    """Enhance artist metadata"""
-    return {
-        'browseId': artist.get('browseId', ''),
-        'channelId': artist.get('browseId', ''),
-        'name': artist.get('name', 'Unknown Artist'),
-        'title': artist.get('name', 'Unknown Artist'),
-        'thumbnail': ContentProcessor.get_best_thumbnail(artist.get('thumbnails', [])),
-        'thumbnails': artist.get('thumbnails', []),
-        'subscribers': artist.get('subscribers', ''),
-        'resultType': 'artist',
-        'verified': artist.get('verified', False)
-    }
         
         # Add personalized recommendations if user_id provided
         if user_id:
