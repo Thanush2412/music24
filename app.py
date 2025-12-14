@@ -242,6 +242,19 @@ def is_cache_valid(cache_entry: tuple, ttl: timedelta) -> bool:
     return datetime.now() - timestamp < ttl
 
 
+def get_best_thumbnail(thumbnails: List[Dict]) -> str:
+    """Extract the best quality thumbnail URL from thumbnails array"""
+    if not thumbnails:
+        return 'https://via.placeholder.com/300x300/333/fff?text=Artist'
+    
+    # Sort by width (highest first) to get best quality
+    sorted_thumbs = sorted(thumbnails, key=lambda x: x.get('width', 0), reverse=True)
+    
+    # Return the URL of the highest quality thumbnail
+    best_thumb = sorted_thumbs[0]
+    return best_thumb.get('url', 'https://via.placeholder.com/300x300/333/fff?text=Artist')
+
+
 # ==================== ADVANCED RECOMMENDATION ENGINE ====================
 
 def calculate_song_similarity(song1: Dict, song2: Dict) -> float:
@@ -603,6 +616,14 @@ def index():
                 "album": "GET /api/album/<browse_id>",
                 "artist": "GET /api/artist/<channel_id>"
             },
+            "enhanced_artists": {
+                "popular_artists": "GET /api/artists/popular?region=IN&limit=20&category=popular",
+                "trending_artists": "GET /api/artists/popular?region=IN&limit=20&category=trending",
+                "top_artists": "GET /api/artists/popular?region=IN&limit=20&category=top",
+                "artists_by_genre": "GET /api/artists/by-genre?genre=pop&limit=20",
+                "search_artists": "GET /api/search/artists?q=taylor+swift&limit=20",
+                "top_charts_artists": "GET /api/charts/top-artists?country=IN&limit=50"
+            },
             "advanced_features": {
                 "smart_recommendations": "GET /api/recommendations/<video_id>?algorithm=smart&user_id=123&limit=20",
                 "auto_queue": "GET /api/auto-queue/<video_id>?user_id=123&length=10",
@@ -697,7 +718,7 @@ def api_search_albums():
 
 @app.route('/api/search/artists', methods=['GET'])
 def api_search_artists():
-    """Search artists only"""
+    """Enhanced artist search with better metadata"""
     try:
         query = request.args.get('q', '').strip()
         limit = int(request.args.get('limit', 20))
@@ -705,10 +726,207 @@ def api_search_artists():
         if not query:
             return jsonify({"error": "Query parameter 'q' is required"}), 400
         
+        # Check cache first
+        cache_key = f"artist_search_{hashlib.md5(query.encode()).hexdigest()}_{limit}"
+        if cache_key in search_cache:
+            cache_entry = search_cache[cache_key]
+            if is_cache_valid(cache_entry, SEARCH_TTL):
+                data, _ = cache_entry
+                return jsonify(data)
+        
         results = ytmusic.search(query, filter="artists", limit=limit)
-        return jsonify(results)
+        
+        # Enhanced artist data processing
+        enhanced_results = []
+        for artist in results:
+            enhanced_artist = {
+                'browseId': artist.get('browseId', ''),
+                'channelId': artist.get('browseId', ''),  # Alias for compatibility
+                'name': artist.get('name', 'Unknown Artist'),
+                'title': artist.get('name', 'Unknown Artist'),  # Alias for compatibility
+                'thumbnail': get_best_thumbnail(artist.get('thumbnails', [])),
+                'thumbnails': artist.get('thumbnails', []),
+                'subscribers': artist.get('subscribers', ''),
+                'description': artist.get('description', ''),
+                'resultType': 'artist'
+            }
+            enhanced_results.append(enhanced_artist)
+        
+        # Cache the results
+        search_cache[cache_key] = (enhanced_results, datetime.now())
+        return jsonify(enhanced_results)
     except Exception as e:
         print(f"❌ Artists search error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/artists/popular', methods=['GET'])
+def api_popular_artists():
+    """Get popular artists for onboarding and discovery"""
+    try:
+        region = request.args.get('region', 'IN')
+        limit = int(request.args.get('limit', 30))
+        category = request.args.get('category', 'popular')  # popular, trending, top
+        
+        # Check cache first
+        cache_key = f"popular_artists_{region}_{category}_{limit}"
+        if cache_key in artist_cache:
+            cache_entry = artist_cache[cache_key]
+            if is_cache_valid(cache_entry, CONTENT_TTL):
+                data, _ = cache_entry
+                return jsonify(data)
+        
+        # Try multiple search strategies for better results
+        search_queries = []
+        if category == 'popular':
+            search_queries = [
+                f"popular artists {region}",
+                f"top artists {region}",
+                "popular music artists",
+                "famous singers"
+            ]
+        elif category == 'trending':
+            search_queries = [
+                f"trending artists {region}",
+                f"viral artists {region}",
+                "trending music artists"
+            ]
+        else:  # top
+            search_queries = [
+                f"top artists {region}",
+                f"best artists {region}",
+                "top music artists"
+            ]
+        
+        all_artists = []
+        seen_ids = set()
+        
+        # Parallel search for faster results
+        def search_artists_parallel(query):
+            try:
+                return ytmusic.search(query, filter="artists", limit=15)
+            except:
+                return []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(search_artists_parallel, query) for query in search_queries]
+            
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    results = future.result()
+                    for artist in results:
+                        artist_id = artist.get('browseId', '')
+                        if artist_id and artist_id not in seen_ids:
+                            seen_ids.add(artist_id)
+                            enhanced_artist = {
+                                'browseId': artist_id,
+                                'channelId': artist_id,
+                                'name': artist.get('name', 'Unknown Artist'),
+                                'title': artist.get('name', 'Unknown Artist'),
+                                'thumbnail': get_best_thumbnail(artist.get('thumbnails', [])),
+                                'thumbnails': artist.get('thumbnails', []),
+                                'subscribers': artist.get('subscribers', ''),
+                                'description': artist.get('description', ''),
+                                'resultType': 'artist',
+                                'category': category
+                            }
+                            all_artists.append(enhanced_artist)
+                            
+                            if len(all_artists) >= limit:
+                                break
+                except Exception as e:
+                    print(f"Error in parallel artist search: {e}")
+                    continue
+                
+                if len(all_artists) >= limit:
+                    break
+        
+        # Shuffle for variety and limit results
+        random.shuffle(all_artists)
+        final_results = all_artists[:limit]
+        
+        # Cache the results
+        artist_cache[cache_key] = (final_results, datetime.now())
+        return jsonify(final_results)
+        
+    except Exception as e:
+        print(f"❌ Popular artists error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/artists/by-genre', methods=['GET'])
+def api_artists_by_genre():
+    """Get artists by specific genre"""
+    try:
+        genre = request.args.get('genre', 'pop').lower()
+        limit = int(request.args.get('limit', 20))
+        
+        # Check cache first
+        cache_key = f"artists_genre_{genre}_{limit}"
+        if cache_key in artist_cache:
+            cache_entry = artist_cache[cache_key]
+            if is_cache_valid(cache_entry, CONTENT_TTL):
+                data, _ = cache_entry
+                return jsonify(data)
+        
+        # Genre-specific search queries
+        genre_queries = {
+            'pop': ['pop artists', 'pop singers', 'popular pop music'],
+            'rock': ['rock artists', 'rock bands', 'rock singers'],
+            'hip-hop': ['hip hop artists', 'rap artists', 'hip hop singers'],
+            'edm': ['edm artists', 'electronic artists', 'dj artists'],
+            'jazz': ['jazz artists', 'jazz musicians', 'jazz singers'],
+            'classical': ['classical artists', 'classical musicians', 'orchestra'],
+            'country': ['country artists', 'country singers', 'country music'],
+            'r&b': ['r&b artists', 'rnb singers', 'soul artists'],
+            'indie': ['indie artists', 'independent artists', 'indie music'],
+            'metal': ['metal artists', 'metal bands', 'heavy metal']
+        }
+        
+        queries = genre_queries.get(genre, [f'{genre} artists', f'{genre} singers'])
+        
+        all_artists = []
+        seen_ids = set()
+        
+        for query in queries:
+            try:
+                results = ytmusic.search(query, filter="artists", limit=10)
+                for artist in results:
+                    artist_id = artist.get('browseId', '')
+                    if artist_id and artist_id not in seen_ids:
+                        seen_ids.add(artist_id)
+                        enhanced_artist = {
+                            'browseId': artist_id,
+                            'channelId': artist_id,
+                            'name': artist.get('name', 'Unknown Artist'),
+                            'title': artist.get('name', 'Unknown Artist'),
+                            'thumbnail': get_best_thumbnail(artist.get('thumbnails', [])),
+                            'thumbnails': artist.get('thumbnails', []),
+                            'subscribers': artist.get('subscribers', ''),
+                            'genre': genre,
+                            'resultType': 'artist'
+                        }
+                        all_artists.append(enhanced_artist)
+                        
+                        if len(all_artists) >= limit:
+                            break
+            except Exception as e:
+                print(f"Error searching {query}: {e}")
+                continue
+            
+            if len(all_artists) >= limit:
+                break
+        
+        # Shuffle and limit
+        random.shuffle(all_artists)
+        final_results = all_artists[:limit]
+        
+        # Cache the results
+        artist_cache[cache_key] = (final_results, datetime.now())
+        return jsonify(final_results)
+        
+    except Exception as e:
+        print(f"❌ Artists by genre error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -974,18 +1192,89 @@ def api_charts_top_songs():
 
 @app.route('/api/charts/top-artists', methods=['GET'])
 def api_charts_top_artists():
-    """Top artists chart"""
+    """Enhanced top artists chart with better metadata"""
     try:
         country = request.args.get('country', 'IN')
         limit = int(request.args.get('limit', 50))
         
-        charts = ytmusic.get_charts(country=country)
-        if charts and 'artists' in charts:
-            return jsonify(charts['artists'].get('results', [])[:limit])
+        # Check cache first
+        cache_key = f"top_artists_{country}_{limit}"
+        if cache_key in artist_cache:
+            cache_entry = artist_cache[cache_key]
+            if is_cache_valid(cache_entry, CONTENT_TTL):
+                data, _ = cache_entry
+                return jsonify(data)
         
-        # Fallback
-        results = ytmusic.search(f"top artists {country}", filter='artists', limit=limit)
-        return jsonify(results)
+        enhanced_results = []
+        
+        try:
+            # Try to get official charts first
+            charts = ytmusic.get_charts(country=country)
+            if charts and 'artists' in charts:
+                chart_artists = charts['artists'].get('results', [])[:limit]
+                for artist in chart_artists:
+                    enhanced_artist = {
+                        'browseId': artist.get('browseId', ''),
+                        'channelId': artist.get('browseId', ''),
+                        'name': artist.get('name', 'Unknown Artist'),
+                        'title': artist.get('name', 'Unknown Artist'),
+                        'thumbnail': get_best_thumbnail(artist.get('thumbnails', [])),
+                        'thumbnails': artist.get('thumbnails', []),
+                        'subscribers': artist.get('subscribers', ''),
+                        'rank': len(enhanced_results) + 1,
+                        'resultType': 'artist',
+                        'source': 'charts'
+                    }
+                    enhanced_results.append(enhanced_artist)
+        except Exception as e:
+            print(f"Charts API failed: {e}")
+        
+        # If we don't have enough results, supplement with search
+        if len(enhanced_results) < limit:
+            remaining = limit - len(enhanced_results)
+            search_queries = [
+                f"top artists {country}",
+                f"popular artists {country}",
+                f"famous singers {country}",
+                "trending artists"
+            ]
+            
+            seen_ids = {artist['browseId'] for artist in enhanced_results}
+            
+            for query in search_queries:
+                try:
+                    results = ytmusic.search(query, filter='artists', limit=remaining)
+                    for artist in results:
+                        artist_id = artist.get('browseId', '')
+                        if artist_id and artist_id not in seen_ids:
+                            seen_ids.add(artist_id)
+                            enhanced_artist = {
+                                'browseId': artist_id,
+                                'channelId': artist_id,
+                                'name': artist.get('name', 'Unknown Artist'),
+                                'title': artist.get('name', 'Unknown Artist'),
+                                'thumbnail': get_best_thumbnail(artist.get('thumbnails', [])),
+                                'thumbnails': artist.get('thumbnails', []),
+                                'subscribers': artist.get('subscribers', ''),
+                                'rank': len(enhanced_results) + 1,
+                                'resultType': 'artist',
+                                'source': 'search'
+                            }
+                            enhanced_results.append(enhanced_artist)
+                            
+                            if len(enhanced_results) >= limit:
+                                break
+                except Exception as e:
+                    print(f"Search query failed: {e}")
+                    continue
+                
+                if len(enhanced_results) >= limit:
+                    break
+        
+        # Cache the results
+        artist_cache[cache_key] = (enhanced_results, datetime.now())
+        return jsonify(enhanced_results)
+        
     except Exception as e:
         print(f"❌ Top artists chart error: {e}")
         return jsonify({"error": str(e)}), 500
@@ -1732,3 +2021,13 @@ def api_performance_stats():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+                "auto_queue": AUTO_QUEUE_TTL.total_seconds() / 60
+            }
+        },
+        "timestamp": datetime.now().isoformat()
+    })
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
