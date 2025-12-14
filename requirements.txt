@@ -1,18 +1,54 @@
-Flask
-flask-cors
-flask-limiter
-flask-caching
-werkzeug
+# 🎵 Music24 Professional Backend Requirements
+# Enterprise-grade dependencies for production deployment
 
-ytmusicapi
+# ==================== CORE FRAMEWORK ====================
+Flask==2.3.3
+Flask-CORS==4.0.0
+Flask-Limiter==3.5.0
+Flask-Caching==2.1.0
+Werkzeug==2.3.7
 
-redis
-psycopg2-binary
-SQLAlchemy
+# ==================== DATABASE & CACHING ====================
+SQLAlchemy==2.0.21
+psycopg2-binary==2.9.7
+redis==5.0.0
+alembic==1.12.0
 
-numpy
-scikit-learn
-pandas
+# ==================== ML & ANALYTICS ====================
+numpy==1.24.3
+pandas==2.0.3
+scikit-learn==1.3.0
+scipy==1.11.2
 
-prometheus-client
-structlog
+# ==================== MONITORING & METRICS ====================
+prometheus-client==0.17.1
+structlog==23.1.0
+psutil==5.9.5
+
+# ==================== EXTERNAL APIS ====================
+ytmusicapi==1.3.2
+requests==2.31.0
+
+# ==================== PRODUCTION SERVER ====================
+gunicorn==21.2.0
+gevent==23.7.0
+
+# ==================== SECURITY ====================
+cryptography==41.0.4
+PyJWT==2.8.0
+
+# ==================== UTILITIES ====================
+python-dotenv==1.0.0
+click==8.1.7
+colorama==0.4.6
+
+# ==================== DEVELOPMENT (Optional) ====================
+pytest==7.4.2
+pytest-cov==4.1.0
+black==23.7.0
+flake8==6.0.0
+mypy==1.5.1
+
+# ==================== DEPLOYMENT ====================
+docker==6.1.3
+kubernetes==27.2.0
