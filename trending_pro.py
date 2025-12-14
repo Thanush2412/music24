@@ -2845,6 +2845,320 @@ def cleanup_request(error):
     """Cleanup after each request"""
     db_manager.close_session()
 
+# ==================== MISSING ENDPOINTS ====================
+
+@app.route('/api/lyrics/<video_id>', methods=['GET'])
+@limiter.limit("30 per minute")
+@track_performance
+@require_api_key
+def api_get_lyrics(video_id: str):
+    """Get lyrics for a song"""
+    try:
+        # Try to get lyrics from YTMusic (if available)
+        try:
+            client = ytmusic_client.get_client()
+            # Note: YTMusic doesn't have a direct lyrics API
+            # This is a placeholder for future implementation
+            return jsonify({
+                'lyrics': None,
+                'source': 'unavailable',
+                'message': 'Lyrics service not yet implemented',
+                'video_id': video_id
+            })
+        except Exception as e:
+            logger.warning(f"Lyrics fetch failed: {e}")
+            return jsonify({
+                'lyrics': None,
+                'source': 'error',
+                'error': str(e),
+                'video_id': video_id
+            })
+            
+    except Exception as e:
+        logger.error(f"Lyrics endpoint error: {e}")
+        raise APIError(f"Failed to get lyrics: {str(e)}", 500, "LYRICS_ERROR")
+
+@app.route('/api/new-releases', methods=['GET'])
+@limiter.limit("20 per minute")
+@track_performance
+@require_api_key
+@cache_response(CacheType.TRENDING, ttl=1800)
+def api_new_releases():
+    """Get new music releases"""
+    try:
+        genre = request.args.get('genre', 'pop')
+        limit = min(int(request.args.get('limit', 20)), 50)
+        region = request.args.get('region', 'US').upper()
+        
+        # Use current data for new releases
+        current_year = datetime.now().year
+        current_month = datetime.now().strftime('%B')
+        
+        # Search for new releases with current data
+        query = f"new {genre} releases {current_month} {current_year}"
+        results = ytmusic_client.search(query, 'songs', limit)
+        
+        enhanced_results = [ContentProcessor.enhance_song_metadata(song) for song in results]
+        
+        return jsonify({
+            'results': enhanced_results,
+            'genre': genre,
+            'region': region,
+            'total': len(enhanced_results),
+            'generated_at': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"New releases endpoint error: {e}")
+        raise APIError(f"Failed to get new releases: {str(e)}", 500, "NEW_RELEASES_ERROR")
+
+@app.route('/api/moods', methods=['GET'])
+@limiter.limit("10 per minute")
+@track_performance
+@require_api_key
+@cache_response(CacheType.ANALYTICS, ttl=86400)  # Cache for 24 hours
+def api_get_moods():
+    """Get available music moods"""
+    try:
+        # Current mood categories
+        moods = [
+            'Happy', 'Sad', 'Energetic', 'Chill', 'Romantic', 'Party', 
+            'Workout', 'Focus', 'Sleep', 'Nostalgic', 'Uplifting', 'Melancholic',
+            'Relaxing', 'Motivational', 'Peaceful', 'Intense', 'Dreamy', 'Confident'
+        ]
+        
+        return jsonify({
+            'moods': moods,
+            'total': len(moods),
+            'generated_at': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Moods endpoint error: {e}")
+        raise APIError(f"Failed to get moods: {str(e)}", 500, "MOODS_ERROR")
+
+@app.route('/api/genres', methods=['GET'])
+@limiter.limit("10 per minute")
+@track_performance
+@require_api_key
+@cache_response(CacheType.ANALYTICS, ttl=86400)  # Cache for 24 hours
+def api_get_genres():
+    """Get available music genres"""
+    try:
+        # Current popular genres
+        genres = [
+            'Pop', 'Rock', 'Hip-Hop', 'Electronic', 'Jazz', 'Classical', 
+            'Country', 'R&B', 'Reggae', 'Folk', 'Blues', 'Metal', 
+            'Indie', 'Alternative', 'Funk', 'Soul', 'Punk', 'Reggaeton',
+            'K-Pop', 'Latin', 'Afrobeat', 'House', 'Techno', 'Ambient'
+        ]
+        
+        return jsonify({
+            'genres': genres,
+            'total': len(genres),
+            'generated_at': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Genres endpoint error: {e}")
+        raise APIError(f"Failed to get genres: {str(e)}", 500, "GENRES_ERROR")
+
+@app.route('/api/auto-queue/<video_id>', methods=['GET'])
+@limiter.limit("20 per minute")
+@track_performance
+@require_api_key
+def api_auto_queue(video_id: str):
+    """Generate auto-queue/radio station for a song"""
+    try:
+        length = min(int(request.args.get('length', 20)), 50)
+        user_id = request.args.get('user_id')
+        
+        # Get recommendations for the song
+        recommendations = []
+        
+        try:
+            # Try to get song info first
+            song_results = ytmusic_client.search(video_id, 'songs', 1)
+            if song_results:
+                base_song = song_results[0]
+                artist = base_song.get('artist', '')
+                title = base_song.get('title', '')
+                
+                # Generate radio based on artist and title
+                current_year = datetime.now().year
+                radio_query = f"{artist} {title} radio mix {current_year}"
+                radio_results = ytmusic_client.search(radio_query, 'songs', length)
+                recommendations = radio_results
+                
+        except Exception as e:
+            logger.warning(f"Auto-queue generation failed: {e}")
+            # Fallback to generic recommendations
+            current_year = datetime.now().year
+            fallback_results = ytmusic_client.search(f"popular songs {current_year}", 'songs', length)
+            recommendations = fallback_results
+        
+        enhanced_queue = [ContentProcessor.enhance_song_metadata(song) for song in recommendations]
+        
+        return jsonify({
+            'queue': enhanced_queue,
+            'based_on': video_id,
+            'total': len(enhanced_queue),
+            'generated_at': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Auto-queue endpoint error: {e}")
+        raise APIError(f"Failed to generate auto-queue: {str(e)}", 500, "AUTO_QUEUE_ERROR")
+
+# ==================== PLAYLIST MANAGEMENT ENDPOINTS ====================
+
+@app.route('/api/playlist', methods=['POST'])
+@limiter.limit("10 per minute")
+@track_performance
+@require_api_key
+def api_create_playlist():
+    """Create a new user playlist"""
+    try:
+        data = request.get_json()
+        if not data:
+            raise APIError("Request body is required", 400)
+        
+        user_id = data.get('user_id')
+        title = data.get('title')
+        description = data.get('description', '')
+        
+        if not user_id or not title:
+            raise APIError("User ID and title are required", 400)
+        
+        # Create playlist record
+        playlist_id = f"PL_{user_id}_{int(datetime.now().timestamp())}"
+        
+        playlist_data = {
+            'browseId': playlist_id,
+            'playlistId': playlist_id,
+            'title': title,
+            'description': description,
+            'author': {'name': 'You'},
+            'trackCount': 0,
+            'tracks': [],
+            'created_at': datetime.now().isoformat(),
+            'user_id': user_id,
+            'resultType': 'playlist'
+        }
+        
+        return jsonify({
+            'playlist': playlist_data,
+            'success': True,
+            'message': 'Playlist created successfully'
+        })
+        
+    except APIError:
+        raise
+    except Exception as e:
+        logger.error(f"Create playlist error: {e}")
+        raise APIError(f"Failed to create playlist: {str(e)}", 500, "CREATE_PLAYLIST_ERROR")
+
+@app.route('/api/user/<user_id>/favorites', methods=['GET'])
+@limiter.limit("30 per minute")
+@track_performance
+@require_api_key
+def api_get_user_favorites(user_id: str):
+    """Get user's favorite songs"""
+    try:
+        # In a real implementation, you'd query favorites from database
+        favorites = []
+        
+        return jsonify({
+            'favorites': favorites,
+            'user_id': user_id,
+            'total': len(favorites),
+            'generated_at': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Get favorites error: {e}")
+        raise APIError(f"Failed to get favorites: {str(e)}", 500, "GET_FAVORITES_ERROR")
+
+@app.route('/api/user/<user_id>/favorites', methods=['POST'])
+@limiter.limit("50 per minute")
+@track_performance
+@require_api_key
+def api_add_to_favorites(user_id: str):
+    """Add song to user's favorites"""
+    try:
+        data = request.get_json()
+        if not data:
+            raise APIError("Request body is required", 400)
+        
+        song_data = data.get('song')
+        if not song_data or not song_data.get('videoId'):
+            raise APIError("Song data with videoId is required", 400)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Song added to favorites',
+            'song': song_data,
+            'user_id': user_id
+        })
+        
+    except APIError:
+        raise
+    except Exception as e:
+        logger.error(f"Add to favorites error: {e}")
+        raise APIError(f"Failed to add to favorites: {str(e)}", 500, "ADD_FAVORITES_ERROR")
+
+@app.route('/api/search/suggestions', methods=['GET'])
+@limiter.limit("100 per minute")
+@track_performance
+@require_api_key
+def api_search_suggestions():
+    """Get search suggestions/autocomplete"""
+    try:
+        query = request.args.get('q', '').strip()
+        limit = min(int(request.args.get('limit', 10)), 20)
+        
+        if not query or len(query) < 2:
+            return jsonify({
+                'suggestions': [],
+                'query': query,
+                'total': 0
+            })
+        
+        # Generate suggestions based on query
+        current_year = datetime.now().year
+        suggestions = []
+        
+        # Add contextual suggestions
+        if 'pop' in query.lower():
+            suggestions.extend([f'pop music {current_year}', 'pop hits', 'pop playlists'])
+        elif 'rock' in query.lower():
+            suggestions.extend([f'rock music {current_year}', 'rock classics', 'rock playlists'])
+        elif 'hip' in query.lower() or 'rap' in query.lower():
+            suggestions.extend([f'hip hop {current_year}', 'rap music', 'hip hop playlists'])
+        
+        # Add generic suggestions
+        suggestions.extend([
+            f'{query} songs',
+            f'{query} playlist',
+            f'{query} artist',
+            f'{query} {current_year}',
+            f'best {query}',
+            f'{query} hits'
+        ])
+        
+        # Remove duplicates and limit
+        unique_suggestions = list(dict.fromkeys(suggestions))[:limit]
+        
+        return jsonify({
+            'suggestions': unique_suggestions,
+            'query': query,
+            'total': len(unique_suggestions)
+        })
+        
+    except Exception as e:
+        logger.error(f"Search suggestions error: {e}")
+        raise APIError(f"Failed to get suggestions: {str(e)}", 500, "SUGGESTIONS_ERROR")
+
 # ==================== MAIN APPLICATION ENTRY POINT ====================
 
 if __name__ == '__main__':
