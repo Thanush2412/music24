@@ -76,7 +76,7 @@ class Config:
     ENVIRONMENT: str = os.environ.get("ENVIRONMENT", "production")
     
     # Database Configuration
-    DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql://localhost/music24")
+    DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql://musicdb_f6w4_user:jl2XYYD9DiH6bSk6r9MGPgDM9IU5NO54@dpg-d4v59qu3jp1c73edqr20-a.oregon-postgres.render.com/musicdb_f6w4")
     REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379")
     
     # Performance Configuration
@@ -1534,18 +1534,83 @@ def api_home():
             logger.warning(f"Home content sections failed: {e}")
         
         # Add personalized recommendations if user_id provided
-        if user_id and config.ENABLE_ML_RECOMMENDATIONS and ml_engine.is_trained:
+        if user_id:
             try:
-                if user_id in ml_engine.user_profiles:
+                # Get user profile from database
+                session = db_manager.get_session()
+                if session:
+                    user = session.query(User).filter(User.id == user_id).first()
+                    if user and user.listening_history:
+                        # Get user's favorite artists from listening history
+                        artist_counts = {}
+                        for song in user.listening_history[-50:]:  # Last 50 songs
+                            artist = song.get('artist', '')
+                            if artist:
+                                artist_counts[artist] = artist_counts.get(artist, 0) + 1
+                        
+                        # Get top 3 artists
+                        top_artists = sorted(artist_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+                        
+                        if top_artists:
+                            # Create personalized recommendations based on top artists
+                            rec_queries = []
+                            for artist, count in top_artists:
+                                rec_queries.append(f"{artist} similar artists")
+                                rec_queries.append(f"{artist} best songs")
+                            
+                            # Get recommendations from multiple queries
+                            all_recommendations = []
+                            for query in rec_queries[:3]:  # Limit to 3 queries
+                                try:
+                                    recs = ytmusic_client.search(query, 'songs', 5)
+                                    all_recommendations.extend(recs)
+                                except:
+                                    continue
+                            
+                            # Remove duplicates and enhance
+                            seen_ids = set()
+                            unique_recs = []
+                            for rec in all_recommendations:
+                                video_id = rec.get('videoId')
+                                if video_id and video_id not in seen_ids:
+                                    seen_ids.add(video_id)
+                                    unique_recs.append(rec)
+                                    if len(unique_recs) >= 10:
+                                        break
+                            
+                            home_data['recommendations'] = [ContentProcessor.enhance_song_metadata(song) for song in unique_recs]
+                            home_data['personalized'] = True
+                            
+                            # Also personalize other sections based on user's taste
+                            if top_artists:
+                                main_artist = top_artists[0][0]
+                                try:
+                                    # Personalize new releases with user's favorite genre
+                                    personal_releases = ytmusic_client.search(f"{main_artist} style new music 2024", 'songs', 10)
+                                    home_data['new_releases'] = [ContentProcessor.enhance_song_metadata(song) for song in personal_releases]
+                                except:
+                                    pass
+                    
+                    session.close()
+                
+                # Fallback to ML engine if available
+                elif config.ENABLE_ML_RECOMMENDATIONS and ml_engine.is_trained and user_id in ml_engine.user_profiles:
                     user_profile = ml_engine.user_profiles[user_id]
-                    # Get recommendations based on user's top artists
                     top_artists = list(user_profile.get('top_artists', {}).keys())[:3]
                     if top_artists:
                         rec_query = f"{' '.join(top_artists)} similar music"
                         recommendations = ytmusic_client.search(rec_query, 'songs', 10)
                         home_data['recommendations'] = [ContentProcessor.enhance_song_metadata(song) for song in recommendations]
+                        home_data['personalized'] = True
+                        
             except Exception as e:
-                logger.warning(f"Home recommendations failed: {e}")
+                logger.warning(f"Home personalization failed: {e}")
+                # Fallback to generic recommendations
+                try:
+                    generic_recs = ytmusic_client.search("popular music recommendations", 'songs', 10)
+                    home_data['recommendations'] = [ContentProcessor.enhance_song_metadata(song) for song in generic_recs]
+                except:
+                    home_data['recommendations'] = []
         
         return jsonify(home_data)
         
@@ -1554,6 +1619,128 @@ def api_home():
     except Exception as e:
         logger.error(f"Home endpoint error: {e}")
         raise APIError(f"Home feed failed: {str(e)}", 500, "HOME_ERROR")
+
+@app.route('/api/home/personalized', methods=['POST'])
+@limiter.limit("10 per minute")
+@track_performance
+@require_api_key
+def api_personalized_home():
+    """Get personalized home feed based on selected artists"""
+    try:
+        data = request.get_json()
+        if not data:
+            raise APIError("Request body is required", 400)
+        
+        user_id = data.get('user_id')
+        selected_artists = data.get('artists', [])  # List of artist names
+        region = data.get('region', 'US').upper()
+        
+        if not user_id:
+            raise APIError("User ID is required", 400)
+        
+        if not selected_artists:
+            raise APIError("At least one artist must be selected", 400)
+        
+        # Create personalized home feed based on selected artists
+        personalized_data = {
+            'trending': [],
+            'charts': [],
+            'recommendations': [],
+            'artist_radio': [],
+            'similar_artists': [],
+            'new_releases': [],
+            'personalized': True,
+            'based_on_artists': selected_artists,
+            'region': region,
+            'generated_at': datetime.now().isoformat()
+        }
+        
+        try:
+            # Get songs from selected artists
+            artist_songs = []
+            for artist in selected_artists[:3]:  # Limit to 3 artists
+                try:
+                    songs = ytmusic_client.search(f"{artist} best songs", 'songs', 5)
+                    artist_songs.extend(songs)
+                except:
+                    continue
+            
+            personalized_data['recommendations'] = [ContentProcessor.enhance_song_metadata(song) for song in artist_songs[:15]]
+            
+            # Get similar artists
+            similar_artists_results = []
+            for artist in selected_artists[:2]:
+                try:
+                    similar = ytmusic_client.search(f"{artist} similar artists", 'artists', 3)
+                    similar_artists_results.extend(similar)
+                except:
+                    continue
+            
+            personalized_data['similar_artists'] = similar_artists_results[:6]
+            
+            # Create artist radio (mix of all selected artists)
+            radio_songs = []
+            for artist in selected_artists:
+                try:
+                    radio = ytmusic_client.search(f"{artist} radio mix", 'songs', 8)
+                    radio_songs.extend(radio)
+                except:
+                    continue
+            
+            # Remove duplicates
+            seen_ids = set()
+            unique_radio = []
+            for song in radio_songs:
+                video_id = song.get('videoId')
+                if video_id and video_id not in seen_ids:
+                    seen_ids.add(video_id)
+                    unique_radio.append(song)
+                    if len(unique_radio) >= 20:
+                        break
+            
+            personalized_data['artist_radio'] = [ContentProcessor.enhance_song_metadata(song) for song in unique_radio]
+            
+            # Get new releases in similar style
+            main_artist = selected_artists[0]
+            try:
+                new_releases = ytmusic_client.search(f"{main_artist} style new music 2024", 'songs', 10)
+                personalized_data['new_releases'] = [ContentProcessor.enhance_song_metadata(song) for song in new_releases]
+            except:
+                personalized_data['new_releases'] = []
+            
+            # Update user preferences with selected artists
+            session = db_manager.get_session()
+            if session:
+                try:
+                    user = session.query(User).filter(User.id == user_id).first()
+                    if not user:
+                        user = User(id=user_id, preferences={})
+                        session.add(user)
+                    
+                    if not user.preferences:
+                        user.preferences = {}
+                    
+                    # Update selected artists preference
+                    user.preferences['selected_artists'] = selected_artists
+                    user.preferences['last_personalization'] = datetime.now().isoformat()
+                    
+                    session.commit()
+                    session.close()
+                except Exception as e:
+                    logger.warning(f"Failed to update user preferences: {e}")
+                    if session:
+                        session.close()
+            
+        except Exception as e:
+            logger.warning(f"Personalized content generation failed: {e}")
+        
+        return jsonify(personalized_data)
+        
+    except APIError:
+        raise
+    except Exception as e:
+        logger.error(f"Personalized home error: {e}")
+        raise APIError(f"Personalized home failed: {str(e)}", 500, "PERSONALIZED_HOME_ERROR")
 
 # ==================== RECOMMENDATIONS ENGINE ====================
 
@@ -1795,8 +1982,34 @@ def api_update_user_history(user_id: str):
                 
                 # Update listening history (keep last 500 songs)
                 history = user.listening_history or []
-                history.append(song_data)
+                
+                # Add additional metadata for better personalization
+                enhanced_song_data = {
+                    **song_data,
+                    'played_at': datetime.now().isoformat(),
+                    'session_id': request.headers.get('X-Session-ID', 'unknown'),
+                    'platform': 'mobile'
+                }
+                
+                history.append(enhanced_song_data)
                 user.listening_history = history[-500:]
+                
+                # Update user preferences based on listening patterns
+                if not user.preferences:
+                    user.preferences = {}
+                
+                # Track favorite artists
+                artist = song_data.get('artist', '')
+                if artist:
+                    if 'favorite_artists' not in user.preferences:
+                        user.preferences['favorite_artists'] = {}
+                    user.preferences['favorite_artists'][artist] = user.preferences['favorite_artists'].get(artist, 0) + 1
+                
+                # Track listening times for better recommendations
+                current_hour = datetime.now().hour
+                if 'listening_hours' not in user.preferences:
+                    user.preferences['listening_hours'] = {}
+                user.preferences['listening_hours'][str(current_hour)] = user.preferences['listening_hours'].get(str(current_hour), 0) + 1
                 
                 session.commit()
                 
