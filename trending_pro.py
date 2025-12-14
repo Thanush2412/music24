@@ -824,14 +824,18 @@ class RegionManager:
     
     @classmethod
     def get_trending_query(cls, region: str) -> str:
-        """Generate region-specific trending query"""
+        """Generate current, real-time trending query"""
         region_info = cls.get_region_info(region)
+        current_year = datetime.now().year
+        current_month = datetime.now().strftime('%B')
+        current_day = datetime.now().strftime('%A')
         hour = datetime.now().hour
         
+        # Use current date and time for real-time queries
         base_queries = {
-            'morning': f"trending songs {region_info['name']} morning",
-            'afternoon': f"viral hits {region_info['name']} today",
-            'evening': f"most played songs {region_info['name']} tonight"
+            'morning': f"trending now {current_day} {current_month} {current_year}",
+            'afternoon': f"viral hits today {current_month} {current_year}",
+            'evening': f"most played right now {current_month} {current_year}"
         }
         
         if hour < 12:
@@ -1458,6 +1462,53 @@ def api_charts():
         logger.error(f"Charts error: {e}")
         raise APIError(f"Charts failed: {str(e)}", 500, "CHARTS_ERROR")
 
+# ==================== HELPER FUNCTIONS FOR HOME ENDPOINT ====================
+
+def enhance_album_metadata(album):
+    """Enhance album metadata"""
+    return {
+        'browseId': album.get('browseId', ''),
+        'albumId': album.get('browseId', ''),
+        'title': album.get('title', 'Unknown Album'),
+        'artist': album.get('artist', {}).get('name') if isinstance(album.get('artist'), dict) else album.get('artist', 'Unknown Artist'),
+        'thumbnail': ContentProcessor.get_best_thumbnail(album.get('thumbnails', [])),
+        'thumbnails': album.get('thumbnails', []),
+        'year': album.get('year'),
+        'type': album.get('type', 'Album'),
+        'resultType': 'album',
+        'trackCount': album.get('trackCount', 0),
+        'isExplicit': album.get('isExplicit', False)
+    }
+
+def enhance_playlist_metadata(playlist):
+    """Enhance playlist metadata"""
+    return {
+        'browseId': playlist.get('browseId', ''),
+        'playlistId': playlist.get('browseId', ''),
+        'title': playlist.get('title', 'Unknown Playlist'),
+        'description': playlist.get('description', ''),
+        'thumbnail': ContentProcessor.get_best_thumbnail(playlist.get('thumbnails', [])),
+        'thumbnails': playlist.get('thumbnails', []),
+        'author': playlist.get('author', {}),
+        'trackCount': playlist.get('trackCount', 0),
+        'resultType': 'playlist',
+        'isOfficial': playlist.get('isOfficial', False)
+    }
+
+def enhance_artist_metadata(artist):
+    """Enhance artist metadata"""
+    return {
+        'browseId': artist.get('browseId', ''),
+        'channelId': artist.get('browseId', ''),
+        'name': artist.get('name', 'Unknown Artist'),
+        'title': artist.get('name', 'Unknown Artist'),
+        'thumbnail': ContentProcessor.get_best_thumbnail(artist.get('thumbnails', [])),
+        'thumbnails': artist.get('thumbnails', []),
+        'subscribers': artist.get('subscribers', ''),
+        'resultType': 'artist',
+        'verified': artist.get('verified', False)
+    }
+
 @app.route('/api/home', methods=['GET'])
 @limiter.limit("20 per minute")
 @track_performance
@@ -1508,8 +1559,10 @@ def api_home():
         }
         
         try:
-            # Get trending content
-            trending_query = RegionManager.get_trending_query(region)
+            # Get current trending content - real-time data
+            current_year = datetime.now().year
+            current_month = datetime.now().strftime('%B')
+            trending_query = f"trending now {current_month} {current_year}"
             trending_results = ytmusic_client.search(trending_query, 'songs', 10)
             home_data['trending'] = [ContentProcessor.enhance_song_metadata(song) for song in trending_results]
         except Exception as e:
@@ -1529,38 +1582,44 @@ def api_home():
                 elif isinstance(charts, list):
                     home_data['charts'] = [ContentProcessor.enhance_song_metadata(song) for song in charts[:10]]
             except:
-                # Fallback to search for popular music
-                popular_results = ytmusic_client.search(f"popular music {region}", 'songs', 10)
+                # Fallback to search for current popular music
+                current_year = datetime.now().year
+                popular_results = ytmusic_client.search(f"top hits {current_year}", 'songs', 10)
                 home_data['charts'] = [ContentProcessor.enhance_song_metadata(song) for song in popular_results]
         except Exception as e:
             logger.warning(f"Home charts failed: {e}")
         
         try:
-            # Get diverse content sections - PLAYLIST FOCUSED
+            # Get current year and month for dynamic queries
+            current_year = datetime.now().year
+            current_month = datetime.now().strftime('%B')
+            current_date = datetime.now().strftime('%Y-%m')
+            
+            # Get diverse content sections - CURRENT DATA FOCUSED
             content_sections = {
-                # PLAYLIST SECTIONS (Primary Focus)
-                'featured_playlists': {'query': f"featured playlists {region}", 'type': 'playlists', 'limit': 15},
-                'mood_playlists': {'query': 'mood playlists chill party workout', 'type': 'playlists', 'limit': 12},
-                'genre_playlists': {'query': 'rock pop hip hop electronic playlists', 'type': 'playlists', 'limit': 12},
-                'top_playlists': {'query': f"top playlists {region}", 'type': 'playlists', 'limit': 10},
-                'discover_playlists': {'query': 'discover weekly new music playlists', 'type': 'playlists', 'limit': 10},
-                'artist_playlists': {'query': 'artist essential playlists', 'type': 'playlists', 'limit': 8},
+                # PLAYLIST SECTIONS (Primary Focus) - Using current data
+                'featured_playlists': {'query': f"today's hits {current_year}", 'type': 'playlists', 'limit': 15},
+                'mood_playlists': {'query': f"mood playlists {current_month} {current_year}", 'type': 'playlists', 'limit': 12},
+                'genre_playlists': {'query': f"best playlists {current_year}", 'type': 'playlists', 'limit': 12},
+                'top_playlists': {'query': f"top 50 {current_year}", 'type': 'playlists', 'limit': 10},
+                'discover_playlists': {'query': f"new music {current_month} {current_year}", 'type': 'playlists', 'limit': 10},
+                'artist_playlists': {'query': f"artist radio {current_year}", 'type': 'playlists', 'limit': 8},
                 
-                # CURATED PLAYLIST CATEGORIES
-                'romantic_playlists': {'query': 'romantic love songs playlists', 'type': 'playlists', 'limit': 8},
-                'party_playlists': {'query': 'party dance music playlists', 'type': 'playlists', 'limit': 8},
-                'chill_playlists': {'query': 'chill relaxing music playlists', 'type': 'playlists', 'limit': 8},
-                'workout_playlists': {'query': 'workout gym music playlists', 'type': 'playlists', 'limit': 8},
-                'focus_playlists': {'query': 'focus study music playlists', 'type': 'playlists', 'limit': 8},
-                'sleep_playlists': {'query': 'sleep relaxing music playlists', 'type': 'playlists', 'limit': 6},
+                # CURATED PLAYLIST CATEGORIES - Current trends
+                'romantic_playlists': {'query': f"love songs {current_year}", 'type': 'playlists', 'limit': 8},
+                'party_playlists': {'query': f"party hits {current_year}", 'type': 'playlists', 'limit': 8},
+                'chill_playlists': {'query': f"chill vibes {current_year}", 'type': 'playlists', 'limit': 8},
+                'workout_playlists': {'query': f"workout motivation {current_year}", 'type': 'playlists', 'limit': 8},
+                'focus_playlists': {'query': f"focus music {current_year}", 'type': 'playlists', 'limit': 8},
+                'sleep_playlists': {'query': f"sleep sounds {current_year}", 'type': 'playlists', 'limit': 6},
                 
-                # MIXED CONTENT (Secondary)
-                'recommended_albums': {'query': f"new albums 2024 {region}", 'type': 'albums', 'limit': 10},
-                'trending_artists': {'query': f"trending artists {region}", 'type': 'artists', 'limit': 12},
+                # MIXED CONTENT (Secondary) - Current releases
+                'recommended_albums': {'query': f"new albums {current_month} {current_year}", 'type': 'albums', 'limit': 10},
+                'trending_artists': {'query': f"trending now {current_year}", 'type': 'artists', 'limit': 12},
                 
-                # ESSENTIAL SONGS (Minimal)
-                'trending_songs': {'query': f"trending songs {region}", 'type': 'songs', 'limit': 10},
-                'new_releases': {'query': f"new music 2024 {region}", 'type': 'songs', 'limit': 8},
+                # ESSENTIAL SONGS (Minimal) - Real-time data
+                'trending_songs': {'query': f"viral songs {current_year}", 'type': 'songs', 'limit': 10},
+                'new_releases': {'query': f"latest releases {current_date}", 'type': 'songs', 'limit': 8},
             }
             
             # Fetch content for each section
@@ -1641,8 +1700,10 @@ def api_home():
                             if top_artists:
                                 main_artist = top_artists[0][0]
                                 try:
-                                    # Personalize new releases with user's favorite genre
-                                    personal_releases = ytmusic_client.search(f"{main_artist} style new music 2024", 'songs', 10)
+                                    # Personalize new releases with user's favorite genre - current data
+                                    current_year = datetime.now().year
+                                    current_month = datetime.now().strftime('%B')
+                                    personal_releases = ytmusic_client.search(f"{main_artist} style new music {current_month} {current_year}", 'songs', 10)
                                     home_data['new_releases'] = [ContentProcessor.enhance_song_metadata(song) for song in personal_releases]
                                 except:
                                     pass
@@ -1661,9 +1722,11 @@ def api_home():
                         
             except Exception as e:
                 logger.warning(f"Home personalization failed: {e}")
-                # Fallback to generic recommendations
+                # Fallback to current generic recommendations
                 try:
-                    generic_recs = ytmusic_client.search("popular music recommendations", 'songs', 10)
+                    current_year = datetime.now().year
+                    current_month = datetime.now().strftime('%B')
+                    generic_recs = ytmusic_client.search(f"recommended songs {current_month} {current_year}", 'songs', 10)
                     home_data['recommendations'] = [ContentProcessor.enhance_song_metadata(song) for song in generic_recs]
                 except:
                     home_data['recommendations'] = []
