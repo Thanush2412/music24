@@ -1,6 +1,18 @@
-flask-limiter
 Flask
 flask-cors
-ytmusicapi
-gunicorn
+flask-limiter
+flask-caching
+werkzeug
 
+ytmusicapi
+
+redis
+psycopg2-binary
+SQLAlchemy
+
+numpy
+scikit-learn
+pandas
+
+prometheus-client
+structlog
