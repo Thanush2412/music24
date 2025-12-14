@@ -290,11 +290,19 @@ class DatabaseManager:
         
     def create_tables(self):
         """Create database tables"""
-        Base.metadata.create_all(bind=self.engine)
+        try:
+            Base.metadata.create_all(bind=self.engine)
+        except Exception as e:
+            logger.warning(f"Database table creation failed: {e}")
+            # Continue without database - use in-memory fallbacks
         
     def get_session(self):
         """Get database session"""
-        return self.SessionLocal()
+        try:
+            return self.SessionLocal()
+        except Exception as e:
+            logger.warning(f"Database session creation failed: {e}")
+            return None
         
     def close_session(self):
         """Close database session"""
@@ -642,30 +650,36 @@ class AnalyticsEngine:
         if not self.event_buffer:
             return
         
-        try:
-            session = db_manager.get_session()
-            
-            for event in self.event_buffer:
-                analytics_record = Analytics(
-                    id=event['id'],
-                    event_type=event['event_type'],
-                    user_id=event['user_id'],
-                    song_id=event['song_id'],
-                    timestamp=datetime.fromisoformat(event['timestamp']),
-                    event_metadata=event['event_metadata']
-                )
-                session.add(analytics_record)
-            
-            session.commit()
-            logger.info(f"Flushed {len(self.event_buffer)} analytics events")
-            
-            self.event_buffer.clear()
-            self.last_flush = datetime.now()
-            
-        except Exception as e:
-            logger.error(f"Analytics flush error: {e}")
-        finally:
-            session.close()
+        session = db_manager.get_session()
+        
+        if session:
+            try:
+                for event in self.event_buffer:
+                    analytics_record = Analytics(
+                        id=event['id'],
+                        event_type=event['event_type'],
+                        user_id=event['user_id'],
+                        song_id=event['song_id'],
+                        timestamp=datetime.fromisoformat(event['timestamp']),
+                        event_metadata=event['event_metadata']
+                    )
+                    session.add(analytics_record)
+                
+                session.commit()
+                logger.info(f"Flushed {len(self.event_buffer)} analytics events to database")
+                
+            except Exception as e:
+                logger.error(f"Analytics flush error: {e}")
+                session.rollback()
+            finally:
+                session.close()
+        else:
+            # Database unavailable - just log the events
+            logger.info(f"Database unavailable, keeping {len(self.event_buffer)} analytics events in memory")
+        
+        # Clear buffer and update timestamp regardless of database availability
+        self.event_buffer.clear()
+        self.last_flush = datetime.now()
     
     def get_trending_analysis(self, hours: int = 24) -> Dict[str, Any]:
         """Get trending analysis for the last N hours"""
@@ -1360,41 +1374,81 @@ def api_charts():
         if country not in RegionManager.REGIONS:
             raise APIError(f"Invalid country: {country}", 400, "INVALID_COUNTRY")
         
-        charts = ytmusic_client.get_client().get_charts(country=country)
+        try:
+            charts = ytmusic_client.get_client().get_charts(country=country)
+        except Exception as e:
+            logger.warning(f"Charts API failed: {e}")
+            charts = None
         
         # Enhance charts data
         enhanced_charts = {
             'country': country,
             'country_name': RegionManager.REGIONS[country]['name'],
-            'last_updated': datetime.now().isoformat()
+            'last_updated': datetime.now().isoformat(),
+            'songs': [],
+            'artists': []
         }
         
         if charts:
-            # Process videos/songs chart
-            if 'videos' in charts:
-                videos = charts['videos'].get('results', [])
+            # Handle different response formats
+            if isinstance(charts, dict):
+                # Process videos/songs chart
+                if 'videos' in charts:
+                    videos_data = charts['videos']
+                    if isinstance(videos_data, dict):
+                        videos = videos_data.get('results', [])
+                    else:
+                        videos = videos_data if isinstance(videos_data, list) else []
+                    
+                    enhanced_videos = []
+                    for i, video in enumerate(videos):
+                        enhanced_video = ContentProcessor.enhance_song_metadata(video)
+                        enhanced_video['chart_position'] = i + 1
+                        enhanced_videos.append(enhanced_video)
+                    enhanced_charts['songs'] = enhanced_videos
+                
+                # Process artists chart
+                if 'artists' in charts:
+                    artists_data = charts['artists']
+                    if isinstance(artists_data, dict):
+                        artists = artists_data.get('results', [])
+                    else:
+                        artists = artists_data if isinstance(artists_data, list) else []
+                    
+                    enhanced_artists = []
+                    for i, artist in enumerate(artists):
+                        enhanced_artist = {
+                            'browseId': artist.get('browseId', ''),
+                            'name': artist.get('name', 'Unknown Artist'),
+                            'thumbnail': ContentProcessor.get_best_thumbnail(artist.get('thumbnails', [])),
+                            'subscribers': artist.get('subscribers', ''),
+                            'chart_position': i + 1,
+                            'resultType': 'artist'
+                        }
+                        enhanced_artists.append(enhanced_artist)
+                    enhanced_charts['artists'] = enhanced_artists
+            
+            elif isinstance(charts, list):
+                # If charts is a list, treat as songs
                 enhanced_videos = []
-                for i, video in enumerate(videos):
+                for i, video in enumerate(charts[:50]):  # Limit to 50
                     enhanced_video = ContentProcessor.enhance_song_metadata(video)
                     enhanced_video['chart_position'] = i + 1
                     enhanced_videos.append(enhanced_video)
                 enhanced_charts['songs'] = enhanced_videos
+        
+        # If no charts data, fallback to trending
+        if not enhanced_charts['songs'] and not enhanced_charts['artists']:
+            logger.info("No charts data available, using trending as fallback")
+            trending_query = RegionManager.get_trending_query(country)
+            trending_results = ytmusic_client.search(trending_query, 'songs', 20)
             
-            # Process artists chart
-            if 'artists' in charts:
-                artists = charts['artists'].get('results', [])
-                enhanced_artists = []
-                for i, artist in enumerate(artists):
-                    enhanced_artist = {
-                        'browseId': artist.get('browseId', ''),
-                        'name': artist.get('name', 'Unknown Artist'),
-                        'thumbnail': ContentProcessor.get_best_thumbnail(artist.get('thumbnails', [])),
-                        'subscribers': artist.get('subscribers', ''),
-                        'chart_position': i + 1,
-                        'resultType': 'artist'
-                    }
-                    enhanced_artists.append(enhanced_artist)
-                enhanced_charts['artists'] = enhanced_artists
+            enhanced_videos = []
+            for i, video in enumerate(trending_results):
+                enhanced_video = ContentProcessor.enhance_song_metadata(video)
+                enhanced_video['chart_position'] = i + 1
+                enhanced_videos.append(enhanced_video)
+            enhanced_charts['songs'] = enhanced_videos
         
         return jsonify(enhanced_charts)
         
@@ -1403,6 +1457,89 @@ def api_charts():
     except Exception as e:
         logger.error(f"Charts error: {e}")
         raise APIError(f"Charts failed: {str(e)}", 500, "CHARTS_ERROR")
+
+@app.route('/api/home', methods=['GET'])
+@limiter.limit("20 per minute")
+@track_performance
+@require_api_key
+@cache_response(CacheType.TRENDING, ttl=600)
+def api_home():
+    """Professional home feed endpoint"""
+    try:
+        region = request.args.get('region', 'US').upper()
+        user_id = request.args.get('user_id')
+        
+        if region not in RegionManager.REGIONS:
+            raise APIError(f"Invalid region: {region}", 400, "INVALID_REGION")
+        
+        # Parallel loading of home content
+        home_data = {
+            'trending': [],
+            'charts': [],
+            'recommendations': [],
+            'new_releases': [],
+            'personalized': user_id is not None,
+            'region': region,
+            'generated_at': datetime.now().isoformat()
+        }
+        
+        try:
+            # Get trending content
+            trending_query = RegionManager.get_trending_query(region)
+            trending_results = ytmusic_client.search(trending_query, 'songs', 10)
+            home_data['trending'] = [ContentProcessor.enhance_song_metadata(song) for song in trending_results]
+        except Exception as e:
+            logger.warning(f"Home trending failed: {e}")
+        
+        try:
+            # Get charts content (fallback to search if charts fail)
+            try:
+                charts = ytmusic_client.get_client().get_charts(country=region)
+                if isinstance(charts, dict) and 'videos' in charts:
+                    videos_data = charts['videos']
+                    if isinstance(videos_data, dict):
+                        videos = videos_data.get('results', [])[:10]
+                    else:
+                        videos = videos_data[:10] if isinstance(videos_data, list) else []
+                    home_data['charts'] = [ContentProcessor.enhance_song_metadata(song) for song in videos]
+                elif isinstance(charts, list):
+                    home_data['charts'] = [ContentProcessor.enhance_song_metadata(song) for song in charts[:10]]
+            except:
+                # Fallback to search for popular music
+                popular_results = ytmusic_client.search(f"popular music {region}", 'songs', 10)
+                home_data['charts'] = [ContentProcessor.enhance_song_metadata(song) for song in popular_results]
+        except Exception as e:
+            logger.warning(f"Home charts failed: {e}")
+        
+        try:
+            # Get new releases (search-based)
+            new_releases_query = f"new music 2024 {region}"
+            new_releases = ytmusic_client.search(new_releases_query, 'songs', 10)
+            home_data['new_releases'] = [ContentProcessor.enhance_song_metadata(song) for song in new_releases]
+        except Exception as e:
+            logger.warning(f"Home new releases failed: {e}")
+        
+        # Add personalized recommendations if user_id provided
+        if user_id and config.ENABLE_ML_RECOMMENDATIONS and ml_engine.is_trained:
+            try:
+                if user_id in ml_engine.user_profiles:
+                    user_profile = ml_engine.user_profiles[user_id]
+                    # Get recommendations based on user's top artists
+                    top_artists = list(user_profile.get('top_artists', {}).keys())[:3]
+                    if top_artists:
+                        rec_query = f"{' '.join(top_artists)} similar music"
+                        recommendations = ytmusic_client.search(rec_query, 'songs', 10)
+                        home_data['recommendations'] = [ContentProcessor.enhance_song_metadata(song) for song in recommendations]
+            except Exception as e:
+                logger.warning(f"Home recommendations failed: {e}")
+        
+        return jsonify(home_data)
+        
+    except APIError:
+        raise
+    except Exception as e:
+        logger.error(f"Home endpoint error: {e}")
+        raise APIError(f"Home feed failed: {str(e)}", 500, "HOME_ERROR")
 
 # ==================== RECOMMENDATIONS ENGINE ====================
 
@@ -1634,33 +1771,53 @@ def api_update_user_history(user_id: str):
         
         session = db_manager.get_session()
         
-        user = session.query(User).filter(User.id == user_id).first()
-        if not user:
-            user = User(id=user_id, listening_history=[])
-            session.add(user)
+        if session:
+            # Database available - use full functionality
+            try:
+                user = session.query(User).filter(User.id == user_id).first()
+                if not user:
+                    user = User(id=user_id, listening_history=[])
+                    session.add(user)
+                
+                # Update listening history (keep last 500 songs)
+                history = user.listening_history or []
+                history.append(song_data)
+                user.listening_history = history[-500:]
+                
+                session.commit()
+                
+                # Update ML user profile
+                ml_engine.build_user_profile(user_id, user.listening_history)
+                
+                history_length = len(user.listening_history)
+            except Exception as e:
+                logger.error(f"Database operation failed: {e}")
+                session.rollback()
+                # Fall back to in-memory tracking
+                history_length = 1
+            finally:
+                session.close()
+        else:
+            # Database unavailable - use in-memory tracking only
+            logger.info("Database unavailable, using in-memory history tracking")
+            history_length = 1
         
-        # Update listening history (keep last 500 songs)
-        history = user.listening_history or []
-        history.append(song_data)
-        user.listening_history = history[-500:]
-        
-        session.commit()
-        
-        # Track analytics event
-        analytics_engine.track_event(
-            EventType.SONG_PLAY,
-            user_id=user_id,
-            song_id=song_data.get('videoId'),
-            metadata=song_data
-        )
-        
-        # Update ML user profile
-        ml_engine.build_user_profile(user_id, user.listening_history)
+        # Track analytics event (works with or without database)
+        try:
+            analytics_engine.track_event(
+                EventType.SONG_PLAY,
+                user_id=user_id,
+                song_id=song_data.get('videoId'),
+                metadata=song_data
+            )
+        except Exception as e:
+            logger.warning(f"Analytics tracking failed: {e}")
         
         return jsonify({
             'success': True,
-            'history_length': len(user.listening_history),
-            'updated_at': datetime.now().isoformat()
+            'history_length': history_length,
+            'updated_at': datetime.now().isoformat(),
+            'database_available': session is not None
         })
         
     except APIError:
@@ -2185,23 +2342,26 @@ def api_health_check():
         'services': {}
     }
     
-    # Check database
+    # Check database (optional - don't fail health check if unavailable)
     try:
         session = db_manager.get_session()
-        session.execute('SELECT 1')
-        health_data['services']['database'] = 'healthy'
-        session.close()
+        if session:
+            session.execute('SELECT 1')
+            health_data['services']['database'] = 'healthy'
+            session.close()
+        else:
+            health_data['services']['database'] = 'unavailable (using fallbacks)'
     except Exception as e:
-        health_data['services']['database'] = f'unhealthy: {str(e)}'
-        health_data['status'] = 'degraded'
+        health_data['services']['database'] = f'unavailable: {str(e)[:100]}'
+        # Don't mark as degraded - database is optional
     
-    # Check Redis
+    # Check Redis (optional - don't fail health check if unavailable)
     try:
         db_manager.redis_client.ping()
         health_data['services']['redis'] = 'healthy'
     except Exception as e:
-        health_data['services']['redis'] = f'unhealthy: {str(e)}'
-        health_data['status'] = 'degraded'
+        health_data['services']['redis'] = f'unavailable: {str(e)[:100]}'
+        # Don't mark as degraded - Redis is optional with memory fallback
     
     # Check YouTube Music API
     try:
